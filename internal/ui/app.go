@@ -11,6 +11,7 @@
 //   - members  成员列表：按在场表渲染 在线/离线/最后活跃（v13.1）
 //   - join     入群面板：join_req 队列 / 核对种子哈希 / verify 模式人工审 / 签 join
 //   - admin    群管面板：kick 除名 / unban / 黑名单定向申诉处理 / 改权限 / 移交
+//   - join     亦展示发给本机的 transfer 联署提案（v17①，a/d 批准或拒绝）
 //   - netdisk  网盘面板：配额、贡献成员、条带健康度、上传/下载/删除
 package ui
 
@@ -51,7 +52,9 @@ type App interface {
 	GrantAdmin(target core.PubKey) error
 	// RevokeAdmin 签 revoke_admin 收放管理权（群主/创建者）。
 	RevokeAdmin(target core.PubKey) error
-	// Transfer 签 transfer 移交群主（新 owner 的 endorse_sig 由宿主收集联署）。
+	// Transfer 发起群主移交：宿主签好 transfer 原文并以定向提案（to=新 owner、
+	// endorse_sig 为空）送达新 owner；生效须新 owner 联署（v17①，见下方提案接口）。
+	// 新 owner==本机时宿主走自领快捷路径（自签联署一步广播）。
 	Transfer(newOwner core.PubKey) error
 	// SetNetdiskMB 签 netdisk 事件改全局配额（0~256，越界宿主直接报错）。
 	SetNetdiskMB(mb int) error
@@ -67,6 +70,17 @@ type App interface {
 	ApproveJoin(reqMsgID string) error
 	// RejectJoin 拒绝申请（不广播任何事件，仅本地出队）。
 	RejectJoin(reqMsgID string) error
+
+	// ---- transfer 联署提案（v17①）----
+
+	// PendingTransfers 返回发给本机的待决 transfer 提案收件箱（现任 owner/
+	// 创建者定向送达、endorse_sig 为空的原文副本）。
+	PendingTransfers() []TransferProposal
+	// ApproveTransfer 对提案同一原文补上本机的联署（EndorseSig）并广播生效；
+	// msgID 支持 "latest" 与唯一前缀匹配。
+	ApproveTransfer(msgID string) error
+	// RejectTransfer 拒绝提案：仅本地丢弃，绝不转发、不产生任何事件。
+	RejectTransfer(msgID string) error
 
 	// ---- 一致性核查（M4，/audit）----
 
@@ -95,6 +109,17 @@ type JoinRequest struct {
 	IdentityNote string
 	// SeedOK 表示宿主已核对随申请递交的种子文件哈希与创世配置一致。
 	SeedOK bool
+}
+
+// TransferProposal 是一条发给本机的待决 transfer 联署提案（v17①）。宿主在
+// 帧接收点截获定向 transfer 提案（Type=transfer、To=本机、EndorseSig 为空、
+// 签名者核对为现任 owner/创建者）后入箱展示，绝不喂 ApplyEvent。
+type TransferProposal struct {
+	// Msg 是收到的定向 transfer 原文（批准时机必须对这同一份消息联署，
+	// EndorseSig 由宿主补签后广播生效）。
+	Msg core.Message
+	// FromOwner 表示宿主已核对签名者确为当前 owner/创建者。
+	FromOwner bool
 }
 
 // Netdisk 是群网盘面板所需的最小门面（netdisk 包实现，main 接线）。
@@ -154,6 +179,9 @@ type RosterEvent struct{ Note string }
 // JoinReqEvent 把新到达/新中继的 join_req 推进入群面板队列。
 type JoinReqEvent struct{ Req JoinRequest }
 
+// TransferProposalEvent 把新到达的发给本机的 transfer 联署提案推进收件箱队列（v17①）。
+type TransferProposalEvent struct{ Prop TransferProposal }
+
 // AppealEvent 是黑名单成员发给本机（具解禁权限者）的定向申诉消息。
 type AppealEvent struct{ Msg core.Message }
 
@@ -163,10 +191,11 @@ type HideEvent struct{ MsgID string }
 // NetdiskEvent 是网盘进度/健康度变化提示。
 type NetdiskEvent struct{ Note string }
 
-func (TextEvent) isUIEvent()    {}
-func (SystemEvent) isUIEvent()  {}
-func (RosterEvent) isUIEvent()  {}
-func (JoinReqEvent) isUIEvent() {}
-func (AppealEvent) isUIEvent()  {}
-func (HideEvent) isUIEvent()    {}
-func (NetdiskEvent) isUIEvent() {}
+func (TextEvent) isUIEvent()             {}
+func (SystemEvent) isUIEvent()           {}
+func (RosterEvent) isUIEvent()           {}
+func (JoinReqEvent) isUIEvent()          {}
+func (TransferProposalEvent) isUIEvent() {}
+func (AppealEvent) isUIEvent()           {}
+func (HideEvent) isUIEvent()             {}
+func (NetdiskEvent) isUIEvent()          {}

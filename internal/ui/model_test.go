@@ -12,14 +12,15 @@ import (
 )
 
 type fakeApp struct {
-	self  core.PubKey
-	r     *fakeRoster
-	sig   core.Signer
-	gid   [32]byte
-	calls []string
-	evCh  chan Event
-	joins []JoinRequest
-	nd    Netdisk
+	self      core.PubKey
+	r         *fakeRoster
+	sig       core.Signer
+	gid       [32]byte
+	calls     []string
+	evCh      chan Event
+	joins     []JoinRequest
+	transfers []TransferProposal
+	nd        Netdisk
 }
 
 func (f *fakeApp) record(name string) { f.calls = append(f.calls, name) }
@@ -65,6 +66,48 @@ func (f *fakeApp) SetOfflineAfter(ms int64) error {
 func (f *fakeApp) PendingJoins() []JoinRequest { return f.joins }
 func (f *fakeApp) ApproveJoin(id string) error { f.record("ApproveJoin:" + id); return nil }
 func (f *fakeApp) RejectJoin(id string) error  { f.record("RejectJoin:" + id); return nil }
+
+func (f *fakeApp) PendingTransfers() []TransferProposal { return f.transfers }
+
+// dropTransfer 按 msg_id（含 "latest"/唯一前缀）从假队列里移除提案，
+// 模拟宿主批准/拒绝后的出队行为。
+func (f *fakeApp) dropTransfer(id string) {
+	matches := make([]int, 0, len(f.transfers))
+	for i, p := range f.transfers {
+		if transferIDMatches(p.Msg.MsgID, id) {
+			matches = append(matches, i)
+		}
+	}
+	if id == "latest" {
+		if len(matches) == 0 {
+			return
+		}
+		matches = matches[len(matches)-1:]
+	}
+	if len(matches) != 1 {
+		return
+	}
+	i := matches[0]
+	f.transfers = append(f.transfers[:i], f.transfers[i+1:]...)
+}
+
+func transferIDMatches(msgID, key string) bool {
+	if key == "latest" {
+		return true
+	}
+	return msgID == key || strings.HasPrefix(msgID, key)
+}
+
+func (f *fakeApp) ApproveTransfer(id string) error {
+	f.record("ApproveTransfer:" + id)
+	f.dropTransfer(id)
+	return nil
+}
+func (f *fakeApp) RejectTransfer(id string) error {
+	f.record("RejectTransfer:" + id)
+	f.dropTransfer(id)
+	return nil
+}
 func (f *fakeApp) Audit() ([]string, error) {
 	f.record("Audit")
 	return []string{"all sources consistent"}, nil
@@ -288,6 +331,93 @@ func TestModelJoinPanelSeedGateAndApprove(t *testing.T) {
 	}
 }
 
+// TestModelTransferProposalPanel 覆盖 v17① 的 UI 侧：transfer 提案在入群面板
+// 第二节日志展示、a/d 键批准与拒绝、/approve /deny /transfers 命令。
+func TestModelTransferProposalPanel(t *testing.T) {
+	m, app := newTestModel(t)
+	old := keyPub(t, 0xbb)
+	prop := TransferProposal{
+		Msg:       core.Message{MsgID: "xfer-1", Sender: old, TSms: 1700000000000},
+		FromOwner: true,
+	}
+	// 事件入箱：聊天流提示 + 队列同步
+	m.Update(evMsg{TransferProposalEvent{Prop: prop}})
+	if !strings.Contains(m.chat[len(m.chat)-1].text, "/approve xfer-1") {
+		t.Fatalf("chat line = %q", m.chat[len(m.chat)-1].text)
+	}
+	app.transfers = []TransferProposal{prop}
+	app.joins = []JoinRequest{{Msg: core.Message{MsgID: "req-1", Sender: keyPub(t, 0xdd)}, Mode: core.ModeAuto, SeedOK: true}}
+	m.setPanel(PanelJoin)
+	if got := m.panelRows(); got != 2 {
+		t.Fatalf("panelRows = %d, want 2 (1 join + 1 transfer)", got)
+	}
+	// 渲染：两节都在，提案行标注待本机联署
+	v := m.View()
+	for _, want := range []string{"req-1", "xfer-1", "pending my endorse"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("join view missing %q:\n%s", want, v)
+		}
+	}
+	// 光标停在 join_req 上按 a：走 ApproveJoin，绝不误碰 transfer
+	send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if !app.has("ApproveJoin:req-1") || app.has("ApproveTransfer:xfer-1") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	// 下移到 transfer 节：a=联署广播
+	send(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.sel != 1 {
+		t.Fatalf("sel = %d", m.sel)
+	}
+	res := send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if !app.has("ApproveTransfer:xfer-1") {
+		t.Fatalf("ApproveTransfer not called; calls=%v res=%v", app.calls, res)
+	}
+	// 签名者非现任 owner/创建者 → 拒绝联署
+	app.calls = nil
+	bad := prop
+	bad.Msg.MsgID = "xfer-bad"
+	bad.FromOwner = false
+	app.transfers = []TransferProposal{bad}
+	m.reloadJoins()
+	m.sel = len(m.joinReqs)
+	send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if app.has("ApproveTransfer:xfer-bad") {
+		t.Fatal("endorsed a proposal whose signer is not owner/creator")
+	}
+	if !strings.Contains(m.status, "not current owner") {
+		t.Fatalf("status = %q", m.status)
+	}
+	// d=拒绝：本地丢弃并出队，不转发
+	app.transfers = []TransferProposal{bad}
+	m.reloadJoins()
+	m.sel = len(m.joinReqs)
+	send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if !app.has("RejectTransfer:xfer-bad") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	if len(m.transfers) != 0 {
+		t.Fatalf("transfer still queued after deny: %+v", m.transfers)
+	}
+	// /transfers 列表（先回聊天面板，斜杠命令在输入行生效）
+	m.setPanel(PanelChat)
+	m.input = "/transfers"
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("/transfers cmd missing")
+	}
+	if note, ok := cmd().(noteMsg); !ok || !strings.Contains(string(note), "none pending") {
+		t.Fatalf("/transfers note = %#v", note)
+	}
+	// /approve latest 与 /deny <前缀>
+	m.input = "/approve latest"
+	send(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m.input = "/deny xfer"
+	send(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !app.has("ApproveTransfer:latest") || !app.has("RejectTransfer:xfer") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+}
+
 func TestModelAdminKickAndPermsPrompt(t *testing.T) {
 	m, app := newTestModel(t)
 	m.setPanel(PanelAdmin)
@@ -342,6 +472,8 @@ func TestModelChatCommandsDispatch(t *testing.T) {
 		{"/grant-admin " + hexOf(target), "GrantAdmin:" + target.Key()},
 		{"/revoke-admin " + hexOf(target), "RevokeAdmin:" + target.Key()},
 		{"/transfer " + hexOf(target), "Transfer:" + target.Key()},
+		{"/approve latest", "ApproveTransfer:latest"},
+		{"/deny abc123", "RejectTransfer:abc123"},
 	}
 	for _, tc := range cases {
 		m.input = tc.in

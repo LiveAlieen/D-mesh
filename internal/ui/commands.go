@@ -26,6 +26,9 @@ const (
 	CmdGrantAdmin // /grant-admin <pub>
 	CmdRevokeAdmin
 	CmdTransfer
+	CmdApprove      // /approve <msg_id|latest|前缀> 联署并广播 transfer 提案（v17①）
+	CmdDeny         // /deny <msg_id|...> 拒绝 transfer 提案（丢弃，绝不转发）
+	CmdTransfers    // /transfers 列出发给本机的待决 transfer 提案
 	CmdOfflineAfter // /offline-after <ms> 本人自报在场阈值（v13.1）
 	CmdSeedCheck    // /seedcheck <path> 核对种子文件哈希与创世配置（M3 入群前提）
 	CmdNetdisk      // /netdisk 打开面板
@@ -40,7 +43,7 @@ const (
 type Command struct {
 	Kind   CmdKind
 	Text   string      // CmdText
-	MsgID  string      // CmdHide
+	MsgID  string      // CmdHide / CmdApprove / CmdDeny（提案以 msg_id 为键）
 	Target core.PubKey // kick/unban/perms/grant/revoke/transfer
 	Perms  []string    // CmdPerms
 	MB     int         // CmdNDSet
@@ -96,6 +99,18 @@ func ParseCommand(line string) (Command, error) {
 	case "transfer":
 		t, err := parseTarget(rest, "transfer")
 		return Command{Kind: CmdTransfer, Target: t}, err
+	case "approve":
+		if rest == "" {
+			return Command{}, fmt.Errorf("usage: /approve <msg_id|latest|唯一前缀>")
+		}
+		return Command{Kind: CmdApprove, MsgID: rest}, nil
+	case "deny":
+		if rest == "" {
+			return Command{}, fmt.Errorf("usage: /deny <msg_id|latest|唯一前缀>")
+		}
+		return Command{Kind: CmdDeny, MsgID: rest}, nil
+	case "transfers":
+		return Command{Kind: CmdTransfers}, nil
 	case "offline-after":
 		return parseOfflineAfter(rest)
 	case "seedcheck":

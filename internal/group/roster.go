@@ -15,7 +15,10 @@
 //   - kick 需 kick 权限位且目标层级严格更低；unban 需 kick 或 unban 权限位；
 //   - presence 仅本人自签、max 合并、不占白名单；
 //   - netdisk 越界（0~256 之外）直接拒绝，且仅群主/创建者可签；
-//   - 黑名单优先：黑名单中的 pub 不得作为成员出现在 join/快照/恢复里。
+//   - 黑名单优先：黑名单中的 pub 不得作为成员出现在 join/快照/恢复里；
+//   - transfer 是唯一可带 to 的名单事件（v17①：提案定向发给新 owner，
+//     新 owner 的联署原文含 to，故生效事件仍带 to=新 owner）；
+//   - 本机脏条目走 DropMember/DropBan 纯本地清洗（clean.go，v17 点 10c）。
 package group
 
 import (
@@ -266,6 +269,9 @@ type Roster struct {
 	seenNext int
 
 	joinReqs []core.Message // 已验签 join_req 收件箱（入群面板轮询；不改名单）
+
+	// drops 是 v17③ 本机清洗（DropMember/DropBan）的有界审计日志。
+	drops []DropRecord
 
 	notifier func(RosterEvent)
 	nowFn    func() time.Time // 测试注入时钟

@@ -200,6 +200,7 @@ func run(o *opts) error {
 	if n.interactive {
 		err = n.runTUI()
 	} else {
+		go n.headlessCommands(ctx) // 无头脚本通道：每行文本=发言，"/…" 走 ui.ParseCommand
 		select {
 		case <-ctx.Done():
 		case err = <-errCh:

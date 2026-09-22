@@ -103,6 +103,12 @@ func mergeSnapshots(
 	sort.Strings(pubOrder)
 	for _, pk := range pubOrder {
 		copies := byPub[pk]
+		// 幂等回放：邻居名单副本天然携带「本机已确立成员」的 join proof，
+		// 重复 ApplyEvent 必报 already-a-member——这是收敛噪声不是违规，与
+		// 黑名单阶段 IsBlacklisted 跳过对称：不重应用、不差评任何来源。
+		if _, present := r.Member(copies[0].e.Pub); present {
+			continue
+		}
 		// 补齐 proof：优先取任一携带有效 proof 的同公钥条目。
 		proofSrc := map[string]core.Proof{} // proof 指纹 -> proof（去重）
 		witness := map[string]core.PubKey{} // proof 指纹 -> 提供来源

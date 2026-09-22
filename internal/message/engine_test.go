@@ -10,14 +10,15 @@ import (
 )
 
 type recorder struct {
-	mu        sync.Mutex
-	chat      []core.Message
-	events    []core.Message
-	hides     []core.Message
-	appeals   []core.Message
-	joinReqs  []core.Message
-	deleted   []string
-	penalties []struct {
+	mu            sync.Mutex
+	chat          []core.Message
+	events        []core.Message
+	hides         []core.Message
+	appeals       []core.Message
+	joinReqs      []core.Message
+	transferProps []core.Message // v17① 联署提案收件（Handlers.TransferProposal）
+	deleted       []string
+	penalties     []struct {
 		from   core.PubKey
 		reason RejectReason
 	}
@@ -35,7 +36,12 @@ func (r *recorder) handlers() Handlers {
 		Hide:        func(m core.Message) { r.mu.Lock(); r.hides = append(r.hides, m); r.mu.Unlock() },
 		Appeal:      func(m core.Message) { r.mu.Lock(); r.appeals = append(r.appeals, m); r.mu.Unlock() },
 		JoinReq:     func(m core.Message) { r.mu.Lock(); r.joinReqs = append(r.joinReqs, m); r.mu.Unlock() },
-		SoftDelete:  func(id string) { r.mu.Lock(); r.deleted = append(r.deleted, id); r.mu.Unlock() },
+		TransferProposal: func(m core.Message) {
+			r.mu.Lock()
+			r.transferProps = append(r.transferProps, m)
+			r.mu.Unlock()
+		},
+		SoftDelete: func(id string) { r.mu.Lock(); r.deleted = append(r.deleted, id); r.mu.Unlock() },
 		Lookup: func(id string) (core.Message, bool) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -644,5 +650,136 @@ func TestNilRosterPureLogicMode(t *testing.T) {
 	out2 := e.eng.Ingest(s.pub, frameOf(t, ev))
 	if !out2.Accepted || out2.Kind != KindRosterEvent {
 		t.Fatalf("%+v", out2)
+	}
+}
+
+// ---------- transfer 联署提案（v17①） ----------
+
+func proposalEnv(t *testing.T) (*env, *testSigner, *testSigner) {
+	t.Helper()
+	e := newEnv(t, true)
+	owner := newTestSigner()
+	e.ros.addMember(owner.pub, core.RoleOwner, core.PermTransfer, core.PermSpeak)
+	newOwner := newTestSigner()
+	e.ros.addMember(newOwner.pub, core.RoleAdmin, core.PermSpeak)
+	return e, owner, newOwner
+}
+
+func makeProposal(t *testing.T, owner *testSigner, to core.PubKey, ts int64) core.Message {
+	t.Helper()
+	m, err := NewMessage(owner, testGroupID, &core.Message{
+		Type: core.TypeTransfer, TSms: ts,
+		Content: []byte(`{"new_owner":{"alg":"ed25519","bytes":"aabb"}}`),
+		To:      &to,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestTransferProposalDeliveredNotApplied(t *testing.T) {
+	e, owner, no := proposalEnv(t)
+	m := makeProposal(t, owner, e.me.pub, 1700000001000) // To=本机
+	out := e.eng.Ingest(owner.pub, frameOf(t, m))
+	if !out.Accepted || out.Kind != KindTransferProposal || !out.Delivered {
+		t.Fatalf("%+v", out)
+	}
+	e.rec.mu.Lock()
+	props, chat, events := len(e.rec.transferProps), len(e.rec.chat), len(e.rec.events)
+	pens := len(e.rec.penalties)
+	applied := len(e.ros.applied)
+	e.rec.mu.Unlock()
+	if props != 1 || chat != 0 || events != 0 {
+		t.Fatalf("props=%d chat=%d events=%d", props, chat, events)
+	}
+	if applied != 0 {
+		t.Fatal("proposal must never reach ApplyEvent")
+	}
+	if pens != 0 {
+		t.Fatalf("legit proposal must not penalize owner: %v", pens)
+	}
+
+	// 生效事件（同 MsgID + EndorseSig）不得被提案误登记的主 dedup 吞掉
+	final := m
+	final.EndorseSig = []byte("endorse-by-new-owner")
+	out2 := e.eng.Ingest(no.pub, frameOf(t, final))
+	if out2.Duplicate || !out2.Accepted || out2.Kind != KindRosterEvent {
+		t.Fatalf("endorsed event swallowed by dedup: %+v", out2)
+	}
+	e.ros.mu.Lock()
+	applied = len(e.ros.applied)
+	e.ros.mu.Unlock()
+	if applied != 1 {
+		t.Fatalf("endorsed transfer must be applied once, got %d", applied)
+	}
+}
+
+func TestTransferProposalDirectedToOtherRelays(t *testing.T) {
+	e, owner, no := proposalEnv(t)
+	m := makeProposal(t, owner, no.pub, 1700000002000) // To=别人
+	out := e.eng.Ingest(pk(10), frameOf(t, m))
+	if !out.Accepted || out.Kind != KindTransferProposal || out.Delivered {
+		t.Fatalf("%+v", out)
+	}
+	if out.Flooded != 2 { // 3 邻居扣除来源 pk(10)
+		t.Fatalf("relay fanout=%d want 2", out.Flooded)
+	}
+	e.rec.mu.Lock()
+	props, pens := len(e.rec.transferProps), len(e.rec.penalties)
+	e.rec.mu.Unlock()
+	if props != 0 || pens != 0 {
+		t.Fatalf("directed-to-other: no delivery/penalty expected, props=%d pens=%d", props, pens)
+	}
+	// relay 匿名去重：再来一轮不重复泛洪
+	out2 := e.eng.Ingest(pk(20), frameOf(t, m))
+	if out2.Accepted && out2.Flooded != 0 {
+		t.Fatalf("second relay must be storm-suppressed: %+v", out2)
+	}
+	// 转发过提案的节点，主 dedup 未被污染：同 id 生效事件正常受理
+	final := m
+	final.EndorseSig = []byte("e")
+	out3 := e.eng.Ingest(no.pub, frameOf(t, final))
+	if out3.Duplicate || !out3.Accepted {
+		t.Fatalf("endorsed event after relay must not be duplicate: %+v", out3)
+	}
+}
+
+func TestTransferProposalRejectsNonOwnerSigner(t *testing.T) {
+	e, _, no := proposalEnv(t)
+	plain := newTestSigner()
+	e.ros.addMember(plain.pub, core.RoleMember, core.PermSpeak)
+	m := makeProposal(t, plain, e.me.pub, 1700000003000)
+	out := e.eng.Ingest(plain.pub, frameOf(t, m))
+	if out.Accepted || out.Reason != ReasonOverreach {
+		t.Fatalf("non-owner proposal: %+v", out)
+	}
+	e.rec.mu.Lock()
+	props, pens := len(e.rec.transferProps), len(e.rec.penalties)
+	e.rec.mu.Unlock()
+	if props != 0 || pens != 1 {
+		t.Fatalf("props=%d pens=%d want 0/1", props, pens)
+	}
+	_ = no
+}
+
+// TestEndorsedTransferFloodsToOriginalOwner 锁死 v17① 的 flood 排他规则：
+// 联署生效事件的 Sender 仍是原提案者（新 owner 只对同一原文补联署），
+// 新 owner 一跳广播时绝不许按 p.Equal(m.Sender) 跳过原 owner，
+// 否则原 owner 永远收不到生效事件、不会让位。
+func TestEndorsedTransferFloodsToOriginalOwner(t *testing.T) {
+	owner := newTestSigner()
+	no := newTestSigner()
+	m := makeProposal(t, owner, no.pub, 1700000004000)
+	m.EndorseSig = []byte("endorsed-by-new-owner")
+	tr := newFakeTransport()
+	engB := NewEngine(testGroupID, no.pub, nil, tr,
+		fakePeers{[]core.PubKey{owner.pub}}, Handlers{})
+	n, err := engB.Publish(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || tr.total() != 1 {
+		t.Fatalf("endorsed event must reach original owner: fanout=%d sent=%d", n, tr.total())
 	}
 }

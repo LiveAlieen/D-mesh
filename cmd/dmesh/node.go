@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -68,6 +71,13 @@ type node struct {
 	joinQ    map[string]ui.JoinRequest // 待处理 join_req（msg_id → 解析结果）
 	joinSeen map[string]bool
 
+	// transfer 联署提案收件箱（v17①）：定向发给本机、EndorseSig 为空的 transfer
+	// 原文，绝不能进 ApplyEvent（缺联署必被拒并给现任 owner 差评）。
+	tmu       sync.Mutex
+	transQ    map[string]ui.TransferProposal
+	transSeen map[string]bool
+	propLim   *spam.Limiter
+
 	// netdisk（仅 netdisk_mb>0 时装配，见 netdisk.go）
 	ndMu      sync.Mutex
 	nd        *netdisk.Manager
@@ -95,6 +105,9 @@ func newNode(ctx context.Context, o *opts, logger *log.Logger, id *identity.Iden
 		pending:     map[string]chan rpcFrame{},
 		joinQ:       map[string]ui.JoinRequest{},
 		joinSeen:    map[string]bool{},
+		transQ:      map[string]ui.TransferProposal{},
+		transSeen:   map[string]bool{},
+		propLim:     spam.NewLimiter(spam.JoinReqRate(), nowMS),
 		manifests:   map[string]*netdisk.Manifest{},
 		maniSeen:    map[string]bool{},
 		offline:     o.offline,
@@ -141,12 +154,13 @@ func newNode(ctx context.Context, o *opts, logger *log.Logger, id *identity.Iden
 
 	// message：验证 + 去重 + flood 流水线；Handlers 把消息层接到 store 与 ui。
 	h := message.Handlers{
-		Chat:        n.onChat,
-		RosterEvent: n.onRosterMsg,
-		Hide:        n.onHideMsg,
-		Appeal:      n.onAppeal,
-		JoinReq:     n.onJoinReq,
-		SoftDelete:  func(idStr string) { _ = st.MarkHidden(idStr) },
+		Chat:             n.onChat,
+		RosterEvent:      n.onRosterMsg,
+		Hide:             n.onHideMsg,
+		Appeal:           n.onAppeal,
+		JoinReq:          n.onJoinReq,
+		TransferProposal: n.onTransferProposal,
+		SoftDelete:       func(idStr string) { _ = st.MarkHidden(idStr) },
 		Lookup: func(msgID string) (core.Message, bool) {
 			m, ok, err := st.GetMessage(msgID)
 			return m, err == nil && ok
@@ -157,10 +171,12 @@ func newNode(ctx context.Context, o *opts, logger *log.Logger, id *identity.Iden
 	n.engine = message.NewEngine(gid, n.self, roster, msgTransport{n.nt}, msgPeers{n.nt}, h)
 
 	// backfill：重上线自动回灌 + /audit。Source 由 rpc.go 的邻居协议粘合，
-	// Cleaner 传 nil（group.Roster 未导出 DropMember/DropBan，见交付报告注记）。
+	// Cleaner 接 group.Roster（v17③）：审计发现的本机脏名单条目实际删除，
+	// rosterCleaner 适配层只加日志，清洗语义全部在 group 包 clean.go。
 	n.bf, err = backfill.New(backfill.Deps{
 		Roster:  roster,
 		Store:   &bfStore{st},
+		Cleaner: &rosterCleaner{r: roster, log: logger},
 		Sources: n.bfSources,
 		Config:  backfill.Config{Scope: backfill.ScopeMode(o.scope)},
 		Now:     nowMS,
@@ -580,6 +596,10 @@ func (n *node) onRosterChange(ev group.RosterEvent) {
 		_, err = n.st.UpsertPresence(*ev.Presence)
 	case group.KindOwnerChanged:
 		err = n.st.SetOwner(*ev.Owner)
+	case group.KindMemberDroppedLocal:
+		err = n.st.DeleteMember(ev.Pub) // v17③ 本机清洗：持久化副本同步删除
+	case group.KindBlacklistDroppedLocal:
+		err = n.st.DeleteBlacklist(ev.Pub)
 	case group.KindNetdiskChanged:
 		cfg := n.cfg
 		cfg.NetdiskMB = ev.NetdiskMB
@@ -593,10 +613,15 @@ func (n *node) onRosterChange(ev group.RosterEvent) {
 		n.log.Printf("persist roster change %d/%s: %v", ev.Kind, ev.Pub, err)
 	}
 	switch ev.Kind {
-	case group.KindMemberUpsert, group.KindMemberDelete, group.KindBlacklistAdd, group.KindBlacklistDelete:
+	case group.KindMemberUpsert, group.KindMemberDelete, group.KindBlacklistAdd, group.KindBlacklistDelete,
+		group.KindMemberDroppedLocal, group.KindBlacklistDroppedLocal:
 		n.refreshNetdiskHosts() // 成员变动 → 网盘出配额集更新（含重平衡触发由 netdisk 包内部按调用处理）
 	}
-	n.pushEvent(ui.RosterEvent{Note: rosterNote(ev)})
+	note := rosterNote(ev)
+	if !n.interactive && note != "" {
+		n.log.Printf("roster: %s", note) // 无 UI 模式下面名单变更进日志（v17③ 清洗可见）
+	}
+	n.pushEvent(ui.RosterEvent{Note: note})
 }
 
 func rosterNote(ev group.RosterEvent) string {
@@ -613,6 +638,10 @@ func rosterNote(ev group.RosterEvent) string {
 		return "owner -> " + ev.Pub.String()
 	case group.KindNetdiskChanged:
 		return fmt.Sprintf("netdisk_mb -> %d", ev.NetdiskMB)
+	case group.KindMemberDroppedLocal:
+		return "local clean: dropped member " + ev.Pub.String() + " (" + ev.Reason + ")"
+	case group.KindBlacklistDroppedLocal:
+		return "local clean: dropped ban " + ev.Pub.String() + " (" + ev.Reason + ")"
 	default:
 		return ""
 	}
@@ -732,6 +761,166 @@ func (n *node) rejectJoin(msgID string) error {
 }
 
 // ---------------------------------------------------------------------------
+// transfer 联署提案收件箱（v17①，宿主侧；UI 面板走 ui.TransferProposalEvent）
+// ---------------------------------------------------------------------------
+
+// onTransferProposal：engine 已核过签名者层级/权限（handleTransferProposal），
+// 这里只做速率与重复抑制后入箱。提案原文绝不喂 ApplyEvent（缺联署必拒）。
+func (n *node) onTransferProposal(m core.Message) {
+	if !m.To.Equal(n.self) {
+		return
+	}
+	if !n.propLim.Allow(m.Sender.Key() + "|proposal") {
+		return
+	}
+	n.tmu.Lock()
+	if n.transSeen[m.MsgID] {
+		n.tmu.Unlock()
+		return
+	}
+	n.transSeen[m.MsgID] = true
+	prop := ui.TransferProposal{Msg: m, FromOwner: true}
+	n.transQ[m.MsgID] = prop
+	n.tmu.Unlock()
+
+	if !n.interactive {
+		fmt.Fprintf(os.Stdout, "[transfer-proposal] %s -> me (msg_id=%s)\n", m.Sender, m.MsgID)
+	}
+	n.pushEvent(ui.TransferProposalEvent{Prop: prop})
+}
+
+// pendingTransfers 按时间序返回收件箱快照。
+func (n *node) pendingTransfers() []ui.TransferProposal {
+	n.tmu.Lock()
+	out := make([]ui.TransferProposal, 0, len(n.transQ))
+	for _, p := range n.transQ {
+		out = append(out, p)
+	}
+	n.tmu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Msg.TSms < out[j].Msg.TSms })
+	return out
+}
+
+// takeTransfer 按 msgID 取出提案（支持 "latest" 与唯一前缀匹配），取出即出箱。
+func (n *node) takeTransfer(msgID string) (ui.TransferProposal, bool) {
+	n.tmu.Lock()
+	defer n.tmu.Unlock()
+	if p, ok := n.transQ[msgID]; ok {
+		delete(n.transQ, msgID)
+		return p, true
+	}
+	cands := n.pendingTransfersLocked()
+	if msgID == "latest" || msgID == "" {
+		if len(cands) == 0 {
+			return ui.TransferProposal{}, false
+		}
+		p := cands[len(cands)-1]
+		delete(n.transQ, p.Msg.MsgID)
+		return p, true
+	}
+	var hit []ui.TransferProposal
+	for _, p := range cands {
+		if strings.HasPrefix(p.Msg.MsgID, msgID) {
+			hit = append(hit, p)
+		}
+	}
+	if len(hit) != 1 {
+		return ui.TransferProposal{}, false
+	}
+	delete(n.transQ, hit[0].Msg.MsgID)
+	return hit[0], true
+}
+
+func (n *node) pendingTransfersLocked() []ui.TransferProposal {
+	out := make([]ui.TransferProposal, 0, len(n.transQ))
+	for _, p := range n.transQ {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Msg.TSms < out[j].Msg.TSms })
+	return out
+}
+
+// headlessCommands 无头模式的 stdin 脚本通道：普通行=发言，"/…" 复用 ui 的
+// 命令解析器派发到 ui.App 宿主方法（v17：transfer/approve 可脚本化，也供
+// E2E 联调）。不支持的交互命令给出提示而非静默丢弃。
+func (n *node) headlessCommands(ctx context.Context) {
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 16<<10), 1<<20)
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "/") {
+			if err := n.SendText(line); err != nil {
+				fmt.Fprintf(os.Stderr, "[cmd] send: %v\n", err)
+			}
+			continue
+		}
+		c, err := ui.ParseCommand(line)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[cmd] %v\n", err)
+			continue
+		}
+		switch c.Kind {
+		case ui.CmdText:
+			err = n.SendText(c.Text)
+		case ui.CmdTransfer:
+			err = n.Transfer(c.Target)
+		case ui.CmdApprove:
+			id := c.MsgID
+			if id == "" {
+				id = "latest"
+			}
+			err = n.ApproveTransfer(id)
+		case ui.CmdDeny:
+			id := c.MsgID
+			if id == "" {
+				id = "latest"
+			}
+			err = n.RejectTransfer(id)
+		case ui.CmdTransfers:
+			for _, p := range n.PendingTransfers() {
+				fmt.Fprintf(os.Stdout, "%s\n", ui.FormatTransferLine(p, time.Now()))
+			}
+		case ui.CmdKick:
+			err = n.Kick(c.Target)
+		case ui.CmdUnban:
+			err = n.Unban(c.Target)
+		case ui.CmdGrantAdmin:
+			err = n.GrantAdmin(c.Target)
+		case ui.CmdRevokeAdmin:
+			err = n.RevokeAdmin(c.Target)
+		case ui.CmdPerms:
+			err = n.SetPerms(c.Target, c.Perms)
+		case ui.CmdHide:
+			err = n.Hide(c.MsgID)
+		case ui.CmdRemove:
+			err = n.Leave()
+		case ui.CmdOfflineAfter:
+			err = n.SetOfflineAfter(c.Millis)
+		case ui.CmdAudit:
+			rows, aerr := n.Audit()
+			for _, r := range rows {
+				fmt.Fprintf(os.Stdout, "[audit] %s\n", r)
+			}
+			err = aerr
+		case ui.CmdQuit:
+			n.shutdown()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "[cmd] 该命令需 TUI 交互模式: %s\n", line)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[cmd] %s: %v\n", line, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // backfill.Store 适配（本地消息视图）
 // ---------------------------------------------------------------------------
 
@@ -774,4 +963,27 @@ func (b *bfStore) MsgIDs(afterTS int64) []string {
 
 func (b *bfStore) Reject(msgID string, reason string) error {
 	return b.st.MarkHidden(msgID)
+}
+
+// ---------------------------------------------------------------------------
+// backfill.Cleaner 适配（v17③：审计发现的本机脏名单条目实际删除）
+// ---------------------------------------------------------------------------
+
+// rosterCleaner 只加日志转接：清洗语义全部在 group.Roster.DropMember/DropBan
+// （纯本地删除、不产生网络事件、创建者/现任 owner 锚点保护、删了等补）。
+type rosterCleaner struct {
+	r   *group.Roster
+	log *log.Logger
+}
+
+var _ backfill.Cleaner = (*rosterCleaner)(nil)
+
+func (c *rosterCleaner) DropMember(p core.PubKey, reason string) {
+	c.log.Printf("backfill audit: DropMember %s reason=%s", p, reason)
+	c.r.DropMember(p, reason)
+}
+
+func (c *rosterCleaner) DropBan(p core.PubKey, reason string) {
+	c.log.Printf("backfill audit: DropBan %s reason=%s", p, reason)
+	c.r.DropBan(p, reason)
 }

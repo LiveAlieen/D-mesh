@@ -19,12 +19,15 @@ type RosterEvent struct {
 	Owner     *core.PubKey
 	NetdiskMB int
 	Msg       *core.Message // KindJoinReqReceived 时携带原始 join_req
+	Reason    string        // Kind*DroppedLocal（v17③ 本机清洗）时携带清洗原因
 }
 
 // RosterEventKind 是计划/通知类型。
 type RosterEventKind int
 
-// 计划类型常量。
+// 计划类型常量。KindMemberDroppedLocal / KindBlacklistDroppedLocal 是
+// v17③ 本机名单清洗的纯本地通知（不来自任何网络事件，仅用于宿主侧
+// 同步删除持久化副本与刷新 UI）。
 const (
 	KindMemberUpsert RosterEventKind = iota
 	KindMemberDelete
@@ -34,6 +37,8 @@ const (
 	KindOwnerChanged
 	KindNetdiskChanged
 	KindJoinReqReceived
+	KindMemberDroppedLocal
+	KindBlacklistDroppedLocal
 )
 
 // SetNotifier 注册状态变更回调（传 nil 取消）。
@@ -213,7 +218,10 @@ func (r *Roster) prepareEvent(m core.Message, drained bool) ([]RosterEvent, erro
 	if m.MsgID == "" {
 		return nil, fmt.Errorf("%w: empty msg_id", core.ErrMalformed)
 	}
-	if m.To != nil {
+	// transfer 是唯一可带 to 的名单事件（v17①：提案定向发给新 owner，
+	// 新 owner 的联署原文含 to，故生效事件仍带 to=新 owner）；其余名单
+	// 事件必须广播（to=nil）。
+	if m.To != nil && m.Type != core.TypeTransfer {
 		return nil, fmt.Errorf("%w: roster events must be broadcast (to must be nil)", core.ErrMalformed)
 	}
 	if m.TSms < 0 {
@@ -510,10 +518,19 @@ func (r *Roster) evGrantRevoke(m core.Message, grant bool) ([]RosterEvent, error
 
 // evTransfer：群主（或创建者）移交 + 新群主对同一原文联署（EndorseSig，
 // 由新群主用自己的密钥与算法签 core.MessageSigPayload(m)）。
+//
+// v17① 定向语义：transfer 是唯一允许携带 to 的名单事件——提案阶段
+// to=新 owner 定向送达（EndorseSig 为空，由集成层收件箱处理，不进本
+// 路径）；联署完成后的生效事件原文含 to，故仍带 to=新 owner 广播，
+// 各节点在此一并校验 to 与 new_owner 一致，防止借定向通道夹带任意目标。
 func (r *Roster) evTransfer(m core.Message, payload []byte) ([]RosterEvent, error) {
 	var c eventTransfer
 	if err := decodeEventContent(m.Content, &c); err != nil {
 		return nil, err
+	}
+	newOwner := c.NewOwner
+	if m.To != nil && !m.To.Equal(newOwner) {
+		return nil, fmt.Errorf("%w: transfer to=%s does not match new_owner", core.ErrMalformed, m.To)
 	}
 	if r.tierOf(m.Sender) < core.TierOwner {
 		return nil, fmt.Errorf("%w: only owner/creator can sign transfer", core.ErrNotPermitted)
@@ -521,16 +538,21 @@ func (r *Roster) evTransfer(m core.Message, payload []byte) ([]RosterEvent, erro
 	if !r.hasPerm(m.Sender, core.PermTransfer) {
 		return nil, fmt.Errorf("%w: signer lacks transfer permission", core.ErrNotPermitted)
 	}
-	newOwner := c.NewOwner
-	if newOwner.Equal(m.Sender) {
+	// 自领（v17 C.4）：仅创建者可签给自己收回群主位——创建者条目永久
+	// 置顶，收回不涉及向下级移交；其余成员自我移交一律无效。
+	isSelfClaim := newOwner.Equal(m.Sender)
+	if isSelfClaim && !r.cfg.Creator.Equal(m.Sender) {
 		return nil, fmt.Errorf("%w: transfer to self", core.ErrMalformed)
+	}
+	if newOwner.Equal(r.owner) {
+		return nil, fmt.Errorf("%w: transfer target is already the owner", core.ErrMalformed)
 	}
 	tgt, ok := r.members[newOwner.Key()]
 	if !ok {
 		return nil, fmt.Errorf("%w: transfer target not a member", core.ErrMalformed)
 	}
-	isCreator := r.cfg.Creator.Equal(newOwner)
-	if !isCreator && r.tierOf(newOwner) >= core.TierOwner {
+	isCreatorTarget := r.cfg.Creator.Equal(newOwner)
+	if !isCreatorTarget && r.tierOf(newOwner) >= core.TierOwner {
 		return nil, fmt.Errorf("%w: transfer target already at owner tier", core.ErrMalformed)
 	}
 	if len(m.EndorseSig) == 0 {
@@ -541,22 +563,49 @@ func (r *Roster) evTransfer(m core.Message, payload []byte) ([]RosterEvent, erro
 	}
 	ownerCopy := clonePub(newOwner)
 	evs := []RosterEvent{{Kind: KindOwnerChanged, MsgID: m.MsgID, Pub: newOwner, Owner: &ownerCopy}}
-	if !isCreator && tgt.Role != core.RoleOwner {
+	if !isCreatorTarget && tgt.Role != core.RoleOwner {
 		up := memberCopy(*tgt)
 		up.Role = core.RoleOwner
 		up.TS = m.TSms
 		evs = append(evs, RosterEvent{Kind: KindMemberUpsert, MsgID: m.MsgID, Pub: newOwner, Member: &up})
 	}
-	// 旧群主让位后降为管理（创建者条目 RoleCreator 不受影响）。
-	if !r.cfg.Creator.Equal(m.Sender) {
-		if cur, ok := r.members[m.Sender.Key()]; ok && cur.Role == core.RoleOwner {
-			down := memberCopy(*cur)
-			down.Role = core.RoleAdmin
-			down.TS = m.TSms
-			evs = append(evs, RosterEvent{Kind: KindMemberUpsert, MsgID: m.MsgID, Pub: m.Sender, Member: &down})
-		}
+	// 旧群主让位后降为管理（v17①）：降的是「当前 owner 指针持有者」而
+	// 非只看签名者——创建者代签移交时，让位的同样是现任群主。创建者
+	// 条目（RoleCreator）不受影响；新 owner 自然排除。
+	for _, prev := range r.demoteCandidatesLocked(newOwner, m.Sender) {
+		cur := r.members[prev.Key()]
+		down := memberCopy(*cur)
+		down.Role = core.RoleAdmin
+		down.TS = m.TSms
+		evs = append(evs, RosterEvent{Kind: KindMemberUpsert, MsgID: m.MsgID, Pub: down.Pub, Member: &down})
 	}
 	return evs, nil
+}
+
+// demoteCandidatesLocked 返回移交后应降为管理的公钥：当前 owner 指针
+// 持有者与签名者中去重后的、在白名单上且 Role==RoleOwner 者（新 owner
+// 除外）。
+func (r *Roster) demoteCandidatesLocked(newOwner, sender core.PubKey) []core.PubKey {
+	var out []core.PubKey
+	for _, p := range [2]core.PubKey{clonePub(r.owner), clonePub(sender)} {
+		if p.IsZero() || p.Equal(newOwner) {
+			continue
+		}
+		known := false
+		for _, q := range out {
+			if q.Equal(p) {
+				known = true
+				break
+			}
+		}
+		if known {
+			continue
+		}
+		if e, ok := r.members[p.Key()]; ok && e.Role == core.RoleOwner {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // evPresence：仅本人自签推进；max 合并（旧值不覆盖新值）；不占白名单、

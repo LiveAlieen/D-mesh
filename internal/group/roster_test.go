@@ -506,3 +506,90 @@ func TestTransferWithEndorsement(t *testing.T) {
 		}
 	})
 }
+
+// evTo 构造带 to 的名单事件（v17①：唯一允许 to 非空的是 transfer）。
+func (e *env) evTo(s core.Signer, to *core.PubKey, typ string, content any, ts int64) core.Message {
+	e.t.Helper()
+	c, err := EncodeEventContent(content)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	m := core.Message{Type: typ, TSms: ts, Content: c, To: to}
+	if err := SignEvent(&m, s, e.gid); err != nil {
+		e.t.Fatal(err)
+	}
+	return m
+}
+
+func TestTransferDirectedAndSelfClaim(t *testing.T) {
+	e := newEnv(t, Options{})
+	base := e.now - 40_000
+	admin, ts := e.bootstrapAdmin(20, base, core.PermTransfer)
+	carol := mkSigner(t, 45)
+
+	t.Run("directedEndorsedTransferAdopted", func(t *testing.T) {
+		// 提案定向（to=新 owner）→ 联署后的生效原文仍含 to → 广播采纳。
+		m := e.evTo(e.creat, ptrOf(admin.Pub()), core.TypeTransfer,
+			eventTransfer{NewOwner: admin.Pub()}, ts)
+		if err := EndorseEvent(&m, admin); err != nil {
+			t.Fatal(err)
+		}
+		e.mustApply(m)
+		if !e.r.Owner().Equal(admin.Pub()) {
+			t.Fatal("owner pointer should move via directed transfer")
+		}
+	})
+	t.Run("directedToMismatchRejected", func(t *testing.T) {
+		e.mustApply(e.joinAs(e.creat, carol.Pub(), ts+1, mkWG(45)))
+		m := e.evTo(e.creat, ptrOf(carol.Pub()), core.TypeTransfer,
+			eventTransfer{NewOwner: admin.Pub()}, ts+2)
+		if err := EndorseEvent(&m, admin); err != nil {
+			t.Fatal(err)
+		}
+		e.wantErr(m, core.ErrMalformed)
+	})
+	t.Run("nonTransferDirectedRejected", func(t *testing.T) {
+		dave := mkSigner(t, 46)
+		m := e.evTo(e.creat, ptrOf(dave.Pub()), core.TypeJoin,
+			eventJoin{Pub: dave.Pub(), WG: mkWG(46), Perms: e.cfg.DefaultPerms}, ts+3)
+		e.wantErr(m, core.ErrMalformed)
+	})
+	t.Run("creatorSelfClaimReclaimsOwnership", func(t *testing.T) {
+		// 自领快捷路径（v17 C.4）：创建者签原文 + 自联署一步生效。
+		m := e.evTo(e.creat, ptrOf(e.cfg.Creator), core.TypeTransfer,
+			eventTransfer{NewOwner: e.cfg.Creator}, ts+4)
+		if err := EndorseEvent(&m, e.creat); err != nil {
+			t.Fatal(err)
+		}
+		e.mustApply(m)
+		if !e.r.Owner().Equal(e.cfg.Creator) {
+			t.Fatal("creator self-claim should move pointer back")
+		}
+		if got := e.r.TierOf(admin.Pub()); got != core.TierAdmin {
+			t.Fatalf("prev owner demoted by creator-signed reclaim: tier=%d", got)
+		}
+	})
+	t.Run("transferToCurrentOwnerRejected", func(t *testing.T) {
+		m := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: e.cfg.Creator}, ts+5)
+		if err := EndorseEvent(&m, e.creat); err != nil {
+			t.Fatal(err)
+		}
+		e.wantErr(m, core.ErrMalformed) // 已是 owner：无操作移交无效
+	})
+	t.Run("nonCreatorSelfClaimRejected", func(t *testing.T) {
+		// 先把群主位交给 admin，再让 admin 自领自签：非创建者无效。
+		m1 := e.evTo(e.creat, ptrOf(admin.Pub()), core.TypeTransfer,
+			eventTransfer{NewOwner: admin.Pub()}, ts+6)
+		if err := EndorseEvent(&m1, admin); err != nil {
+			t.Fatal(err)
+		}
+		e.mustApply(m1)
+		m2 := e.ev(admin, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+7)
+		if err := EndorseEvent(&m2, admin); err != nil {
+			t.Fatal(err)
+		}
+		e.wantErr(m2, core.ErrMalformed)
+	})
+}
+
+func ptrOf(p core.PubKey) *core.PubKey { return &p }

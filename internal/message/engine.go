@@ -29,10 +29,11 @@ type Kind int
 const (
 	KindNone Kind = iota
 	KindChat
-	KindRosterEvent // 名单事件：同路广播、聊天流不显示
-	KindHide        // hide 事件本体（聊天流不显示）
-	KindAppeal      // 黑名单成员的定向申诉（仅解禁权限者可见）
-	KindJoinReq     // 入群请求（递送给 carry 权限者，聊天流不显示）
+	KindRosterEvent      // 名单事件：同路广播、聊天流不显示
+	KindHide             // hide 事件本体（聊天流不显示）
+	KindAppeal           // 黑名单成员的定向申诉（仅解禁权限者可见）
+	KindJoinReq          // 入群请求（递送给 carry 权限者，聊天流不显示）
+	KindTransferProposal // transfer 联署提案（v17①：定向 to=新 owner、EndorseSig 为空）
 )
 
 // String 供日志与断言。
@@ -48,6 +49,8 @@ func (k Kind) String() string {
 		return "appeal"
 	case KindJoinReq:
 		return "join_req"
+	case KindTransferProposal:
+		return "transfer_proposal"
 	default:
 		return "none"
 	}
@@ -90,7 +93,10 @@ type Handlers struct {
 	Hide        func(core.Message) // hide 事件本体
 	Appeal      func(core.Message) // 黑名单成员发给本机的定向申诉
 	JoinReq     func(core.Message) // 本机具 carry 权限时受理的入群请求
-	SoftDelete  func(targetMsgID string)
+	// TransferProposal 本机收到的 v17① 联署提案（To=本机、EndorseSig 为空、
+	// 签名者已核为现任 owner/创建者）；宿主入收件箱展示，批准时补联署广播。
+	TransferProposal func(core.Message)
+	SoftDelete       func(targetMsgID string)
 	// Lookup 查本机已知消息（store 提供）；hide 校验「target 与原发送者同 pubkey」
 	// 与「hide 不可被 hide」用。nil 或查不到 → 进入短期待补队列，目标到达时再校验。
 	Lookup func(msgID string) (core.Message, bool)
@@ -202,6 +208,13 @@ func (e *Engine) process(from core.PubKey, raw []byte, m *core.Message) Outcome 
 		}
 		return e.reject(m, from, reason, err)
 	}
+	// 1.5 v17① transfer 联署提案（定向 to=新 owner、EndorseSig 为空）：
+	//     必须先去重登记之前截获——提案与联署完成后的生效事件共享 msg_id
+	//     （联署绑定原文含 MsgID），若让提案进主 dedup，生效事件会被各节点
+	//     当重复包吞掉，移交永远无法生效。
+	if m.Type == core.TypeTransfer && m.To != nil && len(m.EndorseSig) == 0 {
+		return e.handleTransferProposal(m, raw, from)
+	}
 	// 2. 去重（验签后才记录，防止攻击者用伪造 msg_id 投毒缓存）：
 	//    命中即静默吞掉 —— 不投递、不转发、不差评（防 flood 风暴）。
 	switch e.dedup.Observe(m.MsgID, from) {
@@ -307,6 +320,36 @@ func (e *Engine) handleJoinReq(m *core.Message, raw []byte, from core.PubKey) Ou
 	return Outcome{Accepted: true, Delivered: e.selfCarries(), Flooded: relayed, Kind: KindJoinReq}
 }
 
+// handleTransferProposal：v17① 联署提案的收件与定向递送。规则——
+//  1. 签名者必须是当前具 transfer 权限的 owner/创建者（层级+权限在收时即核，
+//     伪提案直接拒+差评），名单状态以接收时为准；
+//  2. To=本机 → 交 Handlers.TransferProposal 入收件箱（绝不喂 ApplyEvent，
+//     缺联署的原文进 ApplyEvent 只会误伤签发者信誉）；To=他人 → 经 relay
+//     匿名去重定向转发一轮（防风暴，且不污染主 dedup——生效事件与其同 id）；
+//  3. 提案本身永不被本机 ApplyEvent；生效走联署完成后的正式 transfer 事件。
+func (e *Engine) handleTransferProposal(m *core.Message, raw []byte, from core.PubKey) Outcome {
+	if e.Roster != nil {
+		if e.Roster.IsBlacklisted(m.Sender) {
+			return e.reject(m, from, ReasonBlacklisted, fmt.Errorf("%w: proposal sender %s is blacklisted", core.ErrNotPermitted, m.Sender))
+		}
+		if e.Roster.TierOf(m.Sender) < core.TierOwner || !e.Roster.HasPerm(m.Sender, core.PermTransfer) {
+			return e.reject(m, from, ReasonOverreach, fmt.Errorf("%w: transfer proposal signer is not a current owner", core.ErrNotPermitted))
+		}
+	}
+	delivered := false
+	if m.To.Equal(e.Self) {
+		delivered = true
+		if h := e.Handlers.TransferProposal; h != nil {
+			h(*m)
+		}
+	}
+	relayed := 0
+	if !delivered && e.relay.ObserveAnon(m.MsgID) == DedupFresh {
+		relayed = e.flood(raw, m, from)
+	}
+	return Outcome{Accepted: true, Delivered: delivered, Flooded: relayed, Kind: KindTransferProposal}
+}
+
 // handleHide：target 必须与原消息同 pubkey；hide 不可被 hide；本机软删除 + flood。
 // 目标未达时先挂起（pendingHide），目标到达时再校验执行——乱序不丢 hide。
 func (e *Engine) handleHide(m *core.Message, raw []byte, from core.PubKey) Outcome {
@@ -359,14 +402,41 @@ func (e *Engine) Publish(m core.Message) (int, error) {
 	return e.flood(raw, &m, e.Self), nil
 }
 
-// flood 把原始帧推给除 excludeFrom 外的所有邻居（每源一跳 + msg_id 去重 = 全网收敛）。
+// PublishProposal v17①：现任 owner 定向广播 transfer 联署提案（To=新 owner、
+// EndorseSig 为空）。与 Publish 的两点区别——
+//  1. 不登记主 dedup：提案与生效事件共享 msg_id（联署绑定原文含 MsgID），
+//     登记后新 owner 补联署回推的生效事件会被本机自己吞掉；
+//  2. 不本地 ApplyEvent：缺联署原文进 ApplyEvent 必被拒，本机坐等生效事件
+//     返回即可。
+func (e *Engine) PublishProposal(m core.Message) (int, error) {
+	e.init()
+	if m.GroupID != e.GroupID {
+		return 0, fmt.Errorf("%w: group_id mismatch on publish", core.ErrMalformed)
+	}
+	if m.Type != core.TypeTransfer || m.To == nil || len(m.EndorseSig) != 0 {
+		return 0, fmt.Errorf("%w: not a transfer proposal (need type=transfer, to set, empty endorse_sig)", core.ErrMalformed)
+	}
+	if err := VerifyMessage(m); err != nil {
+		return 0, err
+	}
+	raw, err := EncodeFrame(m)
+	if err != nil {
+		return 0, err
+	}
+	return e.flood(raw, &m, e.Self), nil
+}
+
+// flood 把原始帧推给除 excludeFrom（来向那一跳）与本机外的所有邻居（每源一跳
+// + msg_id 去重 = 全网收敛）。注意不得按 m.Sender 排除：v17① 联署 transfer 的
+// 生效事件 Sender=原提案者、由新 owner 发布，必须能送达原提案者本人；
+// 回声由去重缓存兜底，不构成风暴。
 func (e *Engine) flood(raw []byte, m *core.Message, excludeFrom core.PubKey) int {
 	if e.NoForward || e.Trans == nil || e.Peers == nil {
 		return 0
 	}
 	n := 0
 	for _, p := range e.Peers.Peers() {
-		if p.Equal(excludeFrom) || p.Equal(m.Sender) || p.Equal(e.Self) {
+		if p.Equal(excludeFrom) || p.Equal(e.Self) {
 			continue
 		}
 		if err := e.Trans.Send(p, raw); err == nil {

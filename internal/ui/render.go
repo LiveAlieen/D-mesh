@@ -234,6 +234,18 @@ func FormatJoinLine(req JoinRequest, now time.Time) string {
 		ageSuffix(req.Msg.TSms, now))
 }
 
+// FormatTransferLine 渲染一条发给本机的 transfer 联署提案行（v17①）：
+// 提案是现任 owner/创建者定向送达、尚缺本机 endorse_sig 的 transfer 原文。
+func FormatTransferLine(prop TransferProposal, now time.Time) string {
+	sig := "signer-unverified!"
+	if prop.FromOwner {
+		sig = "owner/creator"
+	}
+	return fmt.Sprintf("xfer %.10s from %s -> me (%s, pending my endorse)%s",
+		prop.Msg.MsgID, ShortID(prop.Msg.Sender), sig,
+		ageSuffix(prop.Msg.TSms, now))
+}
+
 func ageSuffix(ms int64, now time.Time) string {
 	if ms <= 0 {
 		return ""

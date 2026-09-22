@@ -260,6 +260,11 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		if _, exists := r.members[jc.Pub.Key()]; exists {
+			// 与生产 group.Roster.evJoin 同语义：重复 join 判 malformed
+			// （回灌幂等守卫的回归测试依赖这条不变量）。
+			return fmt.Errorf("%w: join target already a member", core.ErrMalformed)
+		}
 		r.members[jc.Pub.Key()] = core.MemberEntry{
 			Pub: jc.Pub, WG: jc.WG, Role: core.RoleMember, Perms: jc.Perms,
 			Proof: proofOfNoErr(m), TS: m.TSms,

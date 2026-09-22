@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"dmesh/internal/core"
+	"dmesh/internal/group"
 	"dmesh/internal/message"
 	"dmesh/internal/netdisk"
 	"dmesh/internal/ui"
@@ -78,11 +79,61 @@ func (n *node) RevokeAdmin(target core.PubKey) error {
 	return n.signAndPublish(core.TypeRevokeAdmin, targetContent{Target: target}, n.now())
 }
 
-// Transfer 需要新群主对其同一原文联署（EndorseSig）——对端签名无法由本机代签，
-// 且当前接线层没有「联署交换」的线协议（协议本体归 transport/message，不由集成层发明）。
-// 留接口报错说明；两把密钥同机托管的调试场景可用 dmesh-tool 扩展。
+// Transfer v17①：现任群主（或创建者）发起移交。本机签好 transfer 原文
+// （To=新 owner、EndorseSig 为空）以提案形式定向送达；生效须新 owner 对本机
+// 同一原文补联署后广播（见 ApproveTransfer）。新 owner==本机时走自领快捷路径
+// 一步签全（仅创建者收回合法，group 包 evTransfer 强制该规则）。
 func (n *node) Transfer(newOwner core.PubKey) error {
-	return fmt.Errorf("transfer 需新群主 %s 联署（endorse_sig），集成层无法代签；%w", ui.ShortID(newOwner), core.ErrNotPermitted)
+	if n.roster.TierOf(n.self) < core.TierOwner {
+		return fmt.Errorf("%w: 非群主/创建者不能发起移交", core.ErrNotPermitted)
+	}
+	if !n.roster.HasPerm(n.self, core.PermTransfer) {
+		return fmt.Errorf("%w: 本机不持 transfer 权限", core.ErrNotPermitted)
+	}
+	cb, err := group.EncodeEventContent(transferContent{NewOwner: newOwner})
+	if err != nil {
+		return err
+	}
+	to := newOwner
+	m := core.Message{Type: core.TypeTransfer, Content: cb, TSms: n.now(), To: &to}
+	if err := group.SignEvent(&m, n.id, n.gid); err != nil {
+		return err
+	}
+	if newOwner.Equal(n.self) {
+		if err := group.EndorseEvent(&m, n.id); err != nil {
+			return err
+		}
+		return n.publish(m)
+	}
+	if _, err := n.engine.PublishProposal(m); err != nil {
+		return fmt.Errorf("送出 transfer 提案: %w", err)
+	}
+	n.log.Printf("transfer proposal sent to %s (msg_id=%s)", newOwner, m.MsgID)
+	return nil
+}
+
+// PendingTransfers 返回发给本机的待决 transfer 联署提案收件箱（v17①）。
+func (n *node) PendingTransfers() []ui.TransferProposal { return n.pendingTransfers() }
+
+// ApproveTransfer 对提案同一原文补本机联署并广播生效（v17①）。
+func (n *node) ApproveTransfer(msgID string) error {
+	prop, ok := n.takeTransfer(msgID)
+	if !ok {
+		return fmt.Errorf("transfer 提案 %s 不在收件箱", msgID)
+	}
+	m := prop.Msg
+	if err := group.EndorseEvent(&m, n.id); err != nil {
+		return err
+	}
+	return n.publish(m) // 本机 ApplyEvent 即完成 owner 指针切换；随后 flood 全网
+}
+
+// RejectTransfer 拒绝 transfer 提案：仅本地丢弃，绝不转发、不产生任何事件。
+func (n *node) RejectTransfer(msgID string) error {
+	if _, ok := n.takeTransfer(msgID); !ok {
+		return fmt.Errorf("transfer 提案 %s 不在收件箱", msgID)
+	}
+	return nil
 }
 
 // SetNetdiskMB 群主/创建者签 netdisk 事件改全局配额（0~256，越界由 netdisk/group 拒）。

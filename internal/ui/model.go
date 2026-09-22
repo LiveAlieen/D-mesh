@@ -83,11 +83,12 @@ type Model struct {
 	input  string
 	status string
 
-	members  []MemberRow
-	banned   []core.BlacklistEntry
-	joinReqs []JoinRequest
-	appeals  []core.Message
-	sel      int
+	members   []MemberRow
+	banned    []core.BlacklistEntry
+	joinReqs  []JoinRequest
+	transfers []TransferProposal // 发给本机的待决 transfer 提案（v17①，join 面板展示）
+	appeals   []core.Message
+	sel       int
 
 	prompt *promptState
 
@@ -176,6 +177,11 @@ func (m *Model) handleEvent(ev Event) {
 	case JoinReqEvent:
 		m.upsertJoinReq(e.Req)
 		m.setStatus("new join_req from " + ShortID(e.Req.Msg.Sender) + " (join panel: tab to it)")
+	case TransferProposalEvent:
+		m.upsertTransfer(e.Prop)
+		m.appendChat(chatLine{text: "· transfer proposal from " + ShortID(e.Prop.Msg.Sender) +
+			" — join panel (a/d) or /approve " + e.Prop.Msg.MsgID + " | /deny " + e.Prop.Msg.MsgID, system: true})
+		m.setStatus("transfer proposal from " + ShortID(e.Prop.Msg.Sender) + " (join panel / approve with /approve)")
 	case HideEvent:
 		m.hideLine(e.MsgID)
 	case NetdiskEvent:
@@ -194,6 +200,24 @@ func (m *Model) upsertJoinReq(req JoinRequest) {
 		}
 	}
 	m.joinReqs = append(m.joinReqs, req)
+}
+
+func (m *Model) upsertTransfer(prop TransferProposal) {
+	for i, p := range m.transfers {
+		if p.Msg.MsgID == prop.Msg.MsgID {
+			m.transfers[i] = prop
+			return
+		}
+	}
+	m.transfers = append(m.transfers, prop)
+}
+
+// reloadTransfers 从宿主拉取最新的待决 transfer 提案列表。
+func (m *Model) reloadTransfers() {
+	if m.app == nil {
+		return
+	}
+	m.transfers = m.app.PendingTransfers()
 }
 
 func (m *Model) hideLine(msgID string) {
@@ -231,13 +255,15 @@ func (m *Model) refreshRoster() {
 	}
 }
 
+// reloadJoins 同步入群面板两节队列（join_req + transfer 提案，宿主为事实源）。
 func (m *Model) reloadJoins() {
 	if m.app == nil {
 		return
 	}
 	m.joinReqs = m.app.PendingJoins()
-	if m.sel >= len(m.joinReqs) {
-		m.sel = max0(len(m.joinReqs) - 1)
+	m.transfers = m.app.PendingTransfers()
+	if m.sel >= len(m.joinReqs)+len(m.transfers) {
+		m.sel = max0(len(m.joinReqs) + len(m.transfers) - 1)
 	}
 }
 
@@ -390,7 +416,7 @@ func (m *Model) panelRows() int {
 	case PanelAdmin:
 		return len(m.members) + len(m.banned)
 	case PanelJoin:
-		return len(m.joinReqs)
+		return len(m.joinReqs) + len(m.transfers)
 	case PanelAppeals:
 		return len(m.appeals)
 	default:
@@ -423,12 +449,28 @@ func (m *Model) selectedJoin() (JoinRequest, bool) {
 	return JoinRequest{}, false
 }
 
+// selectedTransfer 返回入群面板第二行（transfer 提案节）的选中项。
+func (m *Model) selectedTransfer() (TransferProposal, bool) {
+	if m.panel != PanelJoin {
+		return TransferProposal{}, false
+	}
+	i := m.sel - len(m.joinReqs)
+	if i >= 0 && i < len(m.transfers) {
+		return m.transfers[i], true
+	}
+	return TransferProposal{}, false
+}
+
 func (m *Model) joinAction(key string) (tea.Model, tea.Cmd) {
 	// 队列宿主所有（PendingJoins 是唯一事实源）：动作前先 reload，否则
 	// 种子核对通过后（宿主把 SeedOK 翻转为 true）面板仍拿着旧的本地副本，
 	// 「核对通过才准签 join」的门控会永久卡住批准。reloadJoins 只同步
 	// 副本与越界的 sel，不改宿主状态，对 d/s 同样安全。
 	m.reloadJoins()
+	// 面板两节：先 join_req 后 transfer 提案（v17①）。
+	if prop, ok := m.selectedTransfer(); ok {
+		return m.transferAction(key, prop)
+	}
 	req, ok := m.selectedJoin()
 	if !ok {
 		return m, nil
@@ -453,6 +495,32 @@ func (m *Model) joinAction(key string) (tea.Model, tea.Cmd) {
 		}
 	case "s": // 核对种子文件哈希（申请人递交或线下拿到的种子路径）
 		m.prompt = &promptState{label: "seed file path to verify", action: "seedcheck", target: req.Msg.Sender}
+	}
+	return m, nil
+}
+
+// transferAction 处理 transfer 提案节（v17①）：
+//   - a：对本机收到的同一份原文补上联署（EndorseSig）并广播生效
+//   - d：拒绝——宿主仅本地丢弃，绝不转发、不产生任何事件
+func (m *Model) transferAction(key string, prop TransferProposal) (tea.Model, tea.Cmd) {
+	if m.app == nil {
+		return m, nil
+	}
+	switch key {
+	case "a":
+		if !prop.FromOwner {
+			m.setStatus("proposal signer is not current owner/creator — refusing to endorse")
+			return m, nil
+		}
+		return m, m.fire(func() error { return m.app.ApproveTransfer(prop.Msg.MsgID) },
+			"transfer endorsed & broadcast")
+	case "d":
+		if err := m.app.RejectTransfer(prop.Msg.MsgID); err != nil {
+			m.setStatus("deny failed: %v", err)
+			return m, nil
+		}
+		m.appendChat(chatLine{text: "· transfer proposal " + truncate(prop.Msg.MsgID, 10) + " denied (dropped locally, never forwarded)", system: true})
+		m.reloadJoins()
 	}
 	return m, nil
 }
@@ -664,6 +732,21 @@ func (m *Model) dispatch(c Command) (tea.Model, tea.Cmd) {
 		return m, m.fire(func() error { return m.app.RevokeAdmin(c.Target) }, "revoke_admin")
 	case CmdTransfer:
 		return m, m.fire(func() error { return m.app.Transfer(c.Target) }, "transfer")
+	case CmdApprove:
+		return m, m.fire(func() error { return m.app.ApproveTransfer(c.MsgID) },
+			"transfer endorsed & broadcast")
+	case CmdDeny:
+		if m.app == nil {
+			return m, nil
+		}
+		if err := m.app.RejectTransfer(c.MsgID); err != nil {
+			m.setStatus("deny failed: %v", err)
+			return m, nil
+		}
+		m.appendChat(chatLine{text: "· transfer proposal " + truncate(c.MsgID, 10) + " denied (dropped locally, never forwarded)", system: true})
+		m.reloadJoins()
+	case CmdTransfers:
+		return m, m.listTransfersCmd()
 	case CmdOfflineAfter:
 		return m, m.fire(func() error { return m.app.SetOfflineAfter(c.Millis) }, "presence threshold update")
 	case CmdSeedCheck:
@@ -680,6 +763,28 @@ func (m *Model) dispatch(c Command) (tea.Model, tea.Cmd) {
 		return m, m.fire(func() error { return m.app.SetNetdiskMB(c.MB) }, fmt.Sprintf("netdisk quota -> %d MB", c.MB))
 	}
 	return m, nil
+}
+
+// listTransfersCmd 列出本机待决的 transfer 联署提案（/transfers）。
+func (m *Model) listTransfersCmd() tea.Cmd {
+	if m.app == nil {
+		return nil
+	}
+	app := m.app
+	return func() tea.Msg {
+		props := app.PendingTransfers()
+		if len(props) == 0 {
+			return noteMsg("transfer proposals: none pending")
+		}
+		now := m.currentTime()
+		var b strings.Builder
+		fmt.Fprintf(&b, "transfer proposals (%d):\n", len(props))
+		for _, p := range props {
+			b.WriteString("  " + FormatTransferLine(p, now) + "\n")
+		}
+		b.WriteString("  /approve <msg_id|latest|唯一前缀> · /deny <same>")
+		return noteMsg(strings.TrimRight(b.String(), "\n"))
+	}
 }
 
 func (m *Model) auditCmd() (tea.Model, tea.Cmd) {
@@ -844,6 +949,27 @@ func (m *Model) joinView() string {
 	if len(m.joinReqs) > 0 {
 		lines = append(lines, styleDim.Render("  a=approve(sign join) d=deny s=check seed file · seed must hash-match genesis (creator-signed only)"))
 	}
+	// transfer 联署提案节（v17①）：定向发给本机、尚缺本机 endorse_sig 的原文。
+	lines = append(lines, styleHeader.Render("transfer proposals addressed to me (a=endorse+broadcast, d=deny)"))
+	if len(m.transfers) == 0 {
+		lines = append(lines, "  (empty)")
+	}
+	for i, prop := range m.transfers {
+		mark := "  "
+		if len(m.joinReqs)+i == m.sel {
+			mark = "> "
+		}
+		line := mark + FormatTransferLine(prop, m.currentTime())
+		if prop.FromOwner {
+			line = styleOnline.Render(line)
+		} else {
+			line = styleBad.Render(line)
+		}
+		lines = append(lines, line)
+	}
+	if len(m.transfers) > 0 {
+		lines = append(lines, styleDim.Render("  a=endorse the exact proposal & broadcast d=drop (never forwarded) · green signer = current owner/creator"))
+	}
 	return strings.Join(trimTo(lines, m.visibleHeight()), "\n")
 }
 
@@ -911,6 +1037,9 @@ const helpText = `commands:
   /unban <pub>               lift a blacklist entry
   /perms <pub> <p1,p2,...>   set perms (signer must outrank target)
   /grant-admin <pub> /revoke-admin <pub> /transfer <pub>
+  /transfers               list transfer endorsement proposals addressed to me
+  /approve <id|latest>     endorse a transfer proposal (same bytes) + broadcast
+  /deny <id|latest>        drop a transfer proposal (never forwarded)
   /offline-after <ms>        self presence threshold (v13.1)
   /seedcheck <path>          verify seed file: recompute group_id + creator_sig
   /netdisk                   open netdisk panel
