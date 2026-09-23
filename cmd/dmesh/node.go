@@ -891,6 +891,15 @@ func (n *node) headlessCommands(ctx context.Context) {
 			for _, l := range ui.ProgressLines() {
 				fmt.Fprintf(os.Stdout, "[progress] %s\n", l)
 			}
+		case ui.CmdTheme:
+			// v23：headless 不装 saver（不读不写 ui_prefs.json），仅回显。
+			if c.Theme == "" {
+				fmt.Fprintf(os.Stdout, "[theme] %s (available: %s)\n", ui.GetTheme(), ui.ThemeList())
+			} else if ui.SetTheme(c.Theme) {
+				fmt.Fprintf(os.Stdout, "[theme] %s\n", ui.GetTheme())
+			} else {
+				fmt.Fprintf(os.Stderr, "[cmd] unknown theme %q (available: %s)\n", c.Theme, ui.ThemeList())
+			}
 		case ui.CmdKick:
 			err = n.Kick(c.Target)
 		case ui.CmdUnban:

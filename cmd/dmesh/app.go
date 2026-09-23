@@ -224,4 +224,13 @@ func (n *node) pushEvent(ev ui.Event) {
 }
 
 // runGUI 启动 Ebitengine 原生窗口前端（v19；ui.Run 内部自带事件泵）。
-func (n *node) runGUI() error { return ui.Run(n) }
+// v23：仅 GUI 通道读写主题偏好 <data>/ui_prefs.json（headless 不读主题）。
+func (n *node) runGUI() error {
+	ui.LoadThemePref(n.o.data)
+	ui.SetThemeSaver(func(name ui.ThemeName) {
+		if err := ui.SaveThemePref(n.o.data, name); err != nil {
+			n.log.Printf("theme prefs: %v", err)
+		}
+	})
+	return ui.Run(n)
+}

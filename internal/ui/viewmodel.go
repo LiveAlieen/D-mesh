@@ -64,10 +64,13 @@ const (
 // ViewLine 是一行待绘制文本。Selected 标记列表选中行（高亮底色）。
 // Meta/Body 为 v20 聊天气泡加分项：Meta=发送者+时间小字行，Body=气泡正文；
 // 两者为空时渲染层回退整行 Text（旧行为，测试断言仍以 Text 为准）。
+// Avatar 为 v23 加分项：发送者 ShortID（头像色块取色/字母与连发分组用），
+// 非聊天行为空。
 type ViewLine struct {
 	Text     string
 	Meta     string
 	Body     string
+	Avatar   string
 	Style    LineStyle
 	Selected bool
 }
@@ -600,6 +603,16 @@ func (v *viewModel) dispatch(c Command) {
 		} else {
 			v.setStatus(Tf("st.langBad", c.Lang, LangList()))
 		}
+	case CmdTheme:
+		if c.Theme == "" {
+			v.setStatus(Tf("st.themeNow", string(GetTheme()), ThemeList()))
+			return
+		}
+		if SetTheme(c.Theme) {
+			v.setStatus(Tf("st.themeSet", string(GetTheme())))
+		} else {
+			v.setStatus(Tf("st.themeBad", c.Theme, ThemeList()))
+		}
 	case CmdText:
 		msg := v.outboundDraft(c.Text)
 		v.appendChat(chatLine{text: FormatChatLine(msg), sender: v.selfPub(), meta: chatMeta(msg), body: chatBody(msg)})
@@ -1074,13 +1087,17 @@ func (v *viewModel) chatSnapshot() []ViewLine {
 			continue
 		}
 		st := StyleChat
+		avatar := ""
 		switch {
 		case l.system:
 			st = StyleSystem
 		case !l.sender.IsZero() && v.app != nil && l.sender.Equal(v.app.Self()):
 			st = StyleSelf
 		}
-		out = append(out, ViewLine{Text: l.text, Meta: l.meta, Body: l.body, Style: st})
+		if !l.sender.IsZero() {
+			avatar = ShortID(l.sender)
+		}
+		out = append(out, ViewLine{Text: l.text, Meta: l.meta, Body: l.body, Avatar: avatar, Style: st})
 	}
 	return out
 }

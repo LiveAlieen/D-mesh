@@ -36,6 +36,7 @@ var changelog = []versionNote{
 	{"v20", "GUI 美化（圆角气泡/药丸标签）+ 中英双语 i18n"},
 	{"v21", "语言目录 JSON 文件化：go:embed 内嵌 + 外置 langs 目录可扩展"},
 	{"v22", "默认语言固定中文 + 补做 v18 /progress 欠账"},
+	{"v23", "GUI 重写 QQ 风格浅色渲染 + /theme 深浅双主题"},
 }
 
 type milestone struct {

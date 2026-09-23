@@ -39,6 +39,7 @@ const (
 	CmdNDDelete     // /netdisk delete <name>
 	CmdNDSet        // /netdisk set <MB> 签 netdisk 事件改配额
 	CmdLang         // /lang <code> 切换界面语言（v20；v21 起语言集合由语言文件驱动，仅 GUI 生效）
+	CmdTheme        // /theme [light|dark] 查询/切换配色主题（v23，仅 GUI 生效）
 )
 
 // Command 是解析结果：Kind + 按类别有效的参数字段。
@@ -46,6 +47,7 @@ type Command struct {
 	Kind   CmdKind
 	Text   string      // CmdText
 	Lang   string      // CmdLang（""=查询当前语言）
+	Theme  string      // CmdTheme（""=查询当前主题）
 	MsgID  string      // CmdHide / CmdApprove / CmdDeny（提案以 msg_id 为键）
 	Target core.PubKey // kick/unban/perms/grant/revoke/transfer
 	Perms  []string    // CmdPerms
@@ -127,6 +129,8 @@ func ParseCommand(line string) (Command, error) {
 		return parseNetdisk(s, rest)
 	case "lang":
 		return Command{Kind: CmdLang, Lang: strings.ToLower(rest)}, nil
+	case "theme":
+		return Command{Kind: CmdTheme, Theme: strings.ToLower(rest)}, nil
 	default:
 		return Command{}, fmt.Errorf("unknown command %q (try /help)", "/"+name)
 	}

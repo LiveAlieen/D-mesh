@@ -34,7 +34,7 @@
   "ev.roster": "· 名单更新：%s",
   "ev.xferChat": "· 收到 %s 的 transfer 提案 — 群管面板（a/d）或 /approve %s | /deny %s",
   "ev.xferStatus": "收到 %s 的 transfer 提案（群管面板，或 /approve 联署）",
-  "help.text": "命令：\n  <文本>                     发送聊天消息（需 speak 权限）\n  /hide <msg_id>             软删除自己发的一条消息（hide 事件）\n  /audit                     按需多源一致性核查\n  /remove                    退群（本人自签 remove；不进黑名单）\n  /kick <pub>                显式 kick 事件 → 移出成员 + 进黑名单\n  /unban <pub>               解除一条黑名单\n  /perms <pub> <p1,p2,...>   改权限（签名者须高过目标层级）\n  /grant-admin <pub> /revoke-admin <pub> /transfer <pub>\n  /transfers                 列出发给本机的待决 transfer 联署提案\n  /approve <id|latest>       按提案原文联署并广播\n  /deny <id|latest>          拒绝提案（丢弃，绝不转发）\n  /offline-after <ms>        本人自报在场离线阈值（v13.1）\n  /seedcheck <path>          核对种子文件：重算 group_id + creator_sig\n  /netdisk                   打开网盘面板\n  /netdisk upload <路径> | download <名称> | delete <名称> | set <MB>\n  /lang <代码>               切换界面语言（不带参数可列出全部可用语言）\n  /progress                  进度双轨：版本迭代 changelog + M0~M6 完成度\n  /help /clear /quit         其他\n  公钥写法：ed25519:<hex> 或裸 <hex>（默认 ed25519）\n面板：tab/shift-tab 循环切换；聊天 成员 入群 群管 网盘 进度\n按键：1..6 直达 · esc=回聊天 · 上/下/pgup/pgdn=滚动聊天 ·\n      列表面板下按键作用于选中行，Enter 或 / 聚焦输入栏",
+  "help.text": "命令：\n  <文本>                     发送聊天消息（需 speak 权限）\n  /hide <msg_id>             软删除自己发的一条消息（hide 事件）\n  /audit                     按需多源一致性核查\n  /remove                    退群（本人自签 remove；不进黑名单）\n  /kick <pub>                显式 kick 事件 → 移出成员 + 进黑名单\n  /unban <pub>               解除一条黑名单\n  /perms <pub> <p1,p2,...>   改权限（签名者须高过目标层级）\n  /grant-admin <pub> /revoke-admin <pub> /transfer <pub>\n  /transfers                 列出发给本机的待决 transfer 联署提案\n  /approve <id|latest>       按提案原文联署并广播\n  /deny <id|latest>          拒绝提案（丢弃，绝不转发）\n  /offline-after <ms>        本人自报在场离线阈值（v13.1）\n  /seedcheck <path>          核对种子文件：重算 group_id + creator_sig\n  /netdisk                   打开网盘面板\n  /netdisk upload <路径> | download <名称> | delete <名称> | set <MB>\n  /lang <代码>               切换界面语言（不带参数可列出全部可用语言）\n  /theme [light|dark]        查询/切换配色主题（v23，仅 GUI）\n  /progress                  进度双轨：版本迭代 changelog + M0~M6 完成度\n  /help /clear /quit         其他\n  公钥写法：ed25519:<hex> 或裸 <hex>（默认 ed25519）\n面板：tab/shift-tab 循环切换；聊天 成员 入群 群管 网盘 进度\n按键：1..6 直达 · esc=回聊天 · 上/下/pgup/pgdn=滚动聊天 ·\n      列表面板下按键作用于选中行，Enter 或 / 聚焦输入栏",
   "input.listFocus": "%s  （列表焦点：按键作用于选中行 · Enter 或 / 进入编辑）",
   "input.placeholder": "输入消息…  输入 /help 查看命令",
   "join.line": "申请 %.10s 来自 %s wg=%s mode=%s %s%s%s",
@@ -109,5 +109,8 @@
   "top.line": "本机=%s · 群组=%s · 成员=%d（在线 %d）· 黑名单=%d · 待审入群=%d · 面板=%s",
   "xfer.line": "transfer %.10s 来自 %s -> 本机（%s，待本机联署）%s",
   "xfer.owner": "owner/创建者",
-  "xfer.unverified": "签名者非现任！"
+  "xfer.unverified": "签名者非现任！",
+  "st.themeNow": "当前主题：%s（/theme light|dark 切换）",
+  "st.themeSet": "主题已切换为 %s",
+  "st.themeBad": "未知主题 %q（可选：%s）"
 }

@@ -832,7 +832,33 @@ func TestVMWrapTextHelper(t *testing.T) {
 	if got := hex8([]byte{0xab, 0xcd}); got != "abcd" {
 		t.Errorf("hex8 = %q", got)
 	}
-	if styleColor(StyleStatus) != colStatus {
+	if styleColor(StyleStatus) != Pal().Status {
 		t.Error("status color mapping")
+	}
+}
+
+func TestVMThemeCommand(t *testing.T) {
+	defer SetTheme(string(GetTheme()))
+	SetTheme(string(ThemeLight))
+	v, app := newTestVM(t)
+	submit(t, v, "/theme")
+	if !strings.Contains(v.status, "light") {
+		t.Fatalf("query status = %q", v.status)
+	}
+	submit(t, v, "/theme dark")
+	if GetTheme() != ThemeDark || !strings.Contains(v.status, "dark") {
+		t.Fatalf("after /theme dark: theme=%q status=%q", GetTheme(), v.status)
+	}
+	submit(t, v, "/theme neon")
+	if GetTheme() != ThemeDark {
+		t.Fatal("unknown theme must not switch")
+	}
+	if !strings.Contains(v.status, "neon") {
+		t.Fatalf("bad theme status = %q", v.status)
+	}
+	for _, c := range app.calls {
+		if strings.HasPrefix(c, "SendText") && strings.Contains(c, "theme") {
+			t.Fatalf("/theme leaked into chat: %v", app.calls)
+		}
 	}
 }

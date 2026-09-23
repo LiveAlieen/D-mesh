@@ -139,3 +139,14 @@ func TestParsePermListRejectsEmptyEntries(t *testing.T) {
 		t.Fatalf("valid perm rejected: %v", err)
 	}
 }
+
+func TestParseThemeCommand(t *testing.T) {
+	c, err := ParseCommand("/theme")
+	if err != nil || c.Kind != CmdTheme || c.Theme != "" {
+		t.Fatalf("ParseCommand(/theme) = %+v, %v", c, err)
+	}
+	c, err = ParseCommand("/theme DARK")
+	if err != nil || c.Kind != CmdTheme || c.Theme != "dark" {
+		t.Fatalf("ParseCommand(/theme DARK) = %+v, %v", c, err)
+	}
+}
