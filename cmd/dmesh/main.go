@@ -7,7 +7,7 @@
 //	→ 先 VerifySeedConfig 载入并验证创世配置（关键顺序：种子未载入前不得接受任何名单事件）
 //	→ store(JSONL+SQLite) 打开 + 恢复双名单
 //	→ transport(黑名单准入 + 定向申诉例外，用现成 Roster 注入) → neighbor(邻居表)
-//	→ message(验证/去重/flood) → ui(bubbletea TUI / 无头模式)
+//	→ message(验证/去重/flood) → ui(Ebitengine 原生窗口 GUI / 无头模式)
 //	→ backfill(重上线自动回灌 + /audit)、spam(限速/评分/本地屏蔽)、netdisk(仅 netdisk_mb>0)
 //
 // 一进程一群：--data 指定实例根目录（多实例隔离），群目录为 <data>/groups/<group_id>/。
@@ -106,7 +106,7 @@ func main() {
 }
 
 func run(o *opts) error {
-	// 0. 日志：TUI 模式写文件避免污染界面；无头模式走 stderr。
+	// 0. 日志：GUI 模式写文件避免污染界面；无头模式走 stderr。
 	if err := os.MkdirAll(o.data, 0o700); err != nil {
 		return fmt.Errorf("mkdir --data: %w", err)
 	}
@@ -193,12 +193,12 @@ func run(o *opts) error {
 	}
 	defer n.shutdown()
 
-	// 6. 事件循环：TUI（bubbletea）或无头。
+	// 6. 事件循环：GUI（Ebitengine 原生窗口）或无头。
 	errCh := make(chan error, 1)
 	go func() { errCh <- n.serve(ctx) }()
 
 	if n.interactive {
-		err = n.runTUI()
+		err = n.runGUI()
 	} else {
 		go n.headlessCommands(ctx) // 无头脚本通道：每行文本=发言，"/…" 走 ui.ParseCommand
 		select {

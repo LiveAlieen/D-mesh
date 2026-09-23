@@ -912,7 +912,7 @@ func (n *node) headlessCommands(ctx context.Context) {
 			n.shutdown()
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "[cmd] 该命令需 TUI 交互模式: %s\n", line)
+			fmt.Fprintf(os.Stderr, "[cmd] 该命令需 GUI 交互模式: %s\n", line)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[cmd] %s: %v\n", line, err)

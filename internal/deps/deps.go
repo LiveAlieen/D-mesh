@@ -22,7 +22,7 @@ import (
 	// 存储层：SQLite 索引/去重/隐藏标记/双名单条目（纯 Go，无 CGO）。
 	_ "modernc.org/sqlite"
 
-	// UI 层：bubbletea + lipgloss TUI。
-	_ "github.com/charmbracelet/bubbletea"
-	_ "github.com/charmbracelet/lipgloss"
+	// UI 层：Ebitengine 原生窗口 GUI（v19，纯 Go 无 cgo）+ 剪贴板粘贴。
+	_ "github.com/atotto/clipboard"
+	_ "github.com/hajimehoshi/ebiten/v2"
 )

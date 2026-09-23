@@ -1,18 +1,24 @@
-// Package ui 是 dmesh 的 bubbletea TUI 层（PLAN.md v16 / M3、M4、M6 的 UI 部分）。
+// Package ui 是 dmesh 的 Ebitengine 原生窗口 GUI 层（PLAN.md v19；
+// 继承 v16 / M3、M4、M6 的 UI 部分）。
 //
 // 依赖纪律（core 包注释第 1 条）：本包只 import dmesh/internal/core 与
-// bubbletea/lipgloss，不 import 任何其它业务包。与外界的全部交互都经由本包
+// 第三方（ebiten/v2、x/image 字体回退、atotto/clipboard），不 import 任何
+// 其它业务包。与外界的全部交互都经由本包
 // 自定义的 App 门面接口（内部暴露 core.Roster / core.Signer 语义），具体实现
 // 由 cmd/dmesh 的 main 在 Integration 阶段接线（message/group/netdisk/backfill
 // 等包各自实现 App 的一个子集，main 聚合成一个 App 实例注入）。
 //
-// 面板：
+// 分层：viewModel（纯状态机，无窗口可测）+ game（ebiten 壳：Update 把
+// 键盘/鼠标/滚轮翻译成 viewModel 调用，Draw 按 Snapshot 绘制）。
+//
+// 面板（Tab/数字键 1..6/鼠标点顶部标签切换）：
 //   - chat     发言 / 接收 / /hide 软删除 / /audit / /netdisk 等命令
 //   - members  成员列表：按在场表渲染 在线/离线/最后活跃（v13.1）
 //   - join     入群面板：join_req 队列 / 核对种子哈希 / verify 模式人工审 / 签 join
-//   - admin    群管面板：kick 除名 / unban / 黑名单定向申诉处理 / 改权限 / 移交
-//   - join     亦展示发给本机的 transfer 联署提案（v17①，a/d 批准或拒绝）
+//   - admin    群管面板：kick 除名 / unban / 改权限 / 移交 / v17 transfer 提案
+//     收件箱（a/d）/ 黑名单定向申诉队列（u=unban / i=忽略）
 //   - netdisk  网盘面板：配额、贡献成员、条带健康度、上传/下载/删除
+//   - progress 进度面板：v18 /progress 欠账占位
 package ui
 
 import "dmesh/internal/core"
@@ -21,9 +27,9 @@ import "dmesh/internal/core"
 // 事件的组包、签名（用 core.Signer）、广播、持久化全部由宿主完成，
 // 从而避免 UI 与 message 包的内容编码形成第二份契约。
 //
-// 并发要求：所有方法可能被 UI 在 tea.Cmd goroutine 里并发调用，宿主必须
-// 自行保证并发安全。SendText/Kick 等发送类方法允许异步（真正广播完成后经
-// NextEvent 以 SystemEvent 回报），但返回 error 表示「受理失败」。
+// 并发要求：所有方法可能被 UI 在工作线程（事件泵/异步任务 goroutine）里并发
+// 调用，宿主必须自行保证并发安全。SendText/Kick 等发送类方法允许异步（真正
+// 广播完成后经 NextEvent 以 SystemEvent 回报），但返回 error 表示「受理失败」。
 type App interface {
 	// Self 返回本机身份公钥。
 	Self() core.PubKey

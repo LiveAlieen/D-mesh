@@ -1,4 +1,4 @@
-// app.go：ui.App 门面宿主实现（bubbletea TUI 与 main 各包之间的桥）+ UI 事件泵。
+// app.go：ui.App 门面宿主实现（Ebitengine GUI 与 main 各包之间的桥）+ UI 事件泵。
 
 package main
 
@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-
-	tea "github.com/charmbracelet/bubbletea"
 
 	"dmesh/internal/core"
 	"dmesh/internal/group"
@@ -225,9 +223,5 @@ func (n *node) pushEvent(ev ui.Event) {
 	}
 }
 
-// runTUI 启动 bubbletea 前端（ui 包提供的 model 构造 API）。
-func (n *node) runTUI() error {
-	p := tea.NewProgram(ui.New(n), tea.WithAltScreen())
-	_, err := p.Run()
-	return err
-}
+// runGUI 启动 Ebitengine 原生窗口前端（v19；ui.Run 内部自带事件泵）。
+func (n *node) runGUI() error { return ui.Run(n) }

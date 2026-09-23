@@ -9,24 +9,11 @@ import (
 	"unicode/utf8"
 
 	"dmesh/internal/core"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
-// ---- lipgloss 样式（仅 View 层使用；纯文本渲染函数保持无色以便测试）----
-
-var (
-	styleHeader  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	styleOnline  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styleOffline = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("240"))
-	styleSelf    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	styleOwner   = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
-	styleAdmin   = lipgloss.NewStyle().Foreground(lipgloss.Color("207"))
-	styleSystem  = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("245"))
-	styleStatus  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleBad     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	styleDim     = lipgloss.NewStyle().Faint(true)
-)
+// v19 起渲染层不再有终端色码（旧的 TUI 样式库已随界面重写一并移除）：
+// 纯文本渲染函数保持不变，GUI 的配色由 viewModel 的 ViewLine.Style
+// （见 viewmodel.go）驱动，由 ebiten 绘制层映射成色板。
 
 // FormatAge 把时长压成紧凑展示串：12s / 3m05s / 1h02m / 2d03h。
 // 负值按 0 处理（时钟小偏差容忍）。纯函数，table-driven 测试。
@@ -112,17 +99,19 @@ func BuildMemberRows(r core.Roster, self core.PubKey, now time.Time) []MemberRow
 	return rows
 }
 
-// RenderMemberLines 输出纯文本成员行（测试用）。
+// RenderMemberLines 输出纯文本成员行（测试与 GUI 快照共用；配色由
+// ViewLine.Style 在 viewModel.Snapshot 侧标注，不再内嵌色码）。
 func RenderMemberLines(rows []MemberRow, now time.Time) []string {
-	return renderMemberLines(rows, now, false)
+	return renderMemberLines(rows, now)
 }
 
-// RenderMemberLinesStyled 输出带色成员行（View 用）。
+// RenderMemberLinesStyled 保留导出契约（v16 时代的带色版本入口）；
+// v19 GUI 下与 RenderMemberLines 等价，样式改由 ViewLine.Style 表达。
 func RenderMemberLinesStyled(rows []MemberRow, now time.Time) []string {
-	return renderMemberLines(rows, now, true)
+	return renderMemberLines(rows, now)
 }
 
-func renderMemberLines(rows []MemberRow, now time.Time, styled bool) []string {
+func renderMemberLines(rows []MemberRow, now time.Time) []string {
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
 		var dot, tail string
@@ -141,32 +130,28 @@ func renderMemberLines(rows []MemberRow, now time.Time, styled bool) []string {
 		if r.IsSelf {
 			name += " (me)"
 		}
-		line := fmt.Sprintf("%s %-22s [%s] %-28s %s",
+		out = append(out, fmt.Sprintf("%s %-22s [%s] %-28s %s",
 			dot, name, RoleLabel(r.Entry.Role),
-			strings.Join(r.Entry.Perms, ","), tail)
-		if styled {
-			line = styleMemberLine(line, r)
-		}
-		out = append(out, line)
+			strings.Join(r.Entry.Perms, ","), tail))
 	}
 	return out
 }
 
-func styleMemberLine(line string, r MemberRow) string {
-	st := styleOnline
-	if !r.Online {
-		st = styleOffline
-	}
+// memberLineStyle 把成员行映射成 GUI 样式（语义对应旧终端版的分色）。
+func memberLineStyle(r MemberRow) LineStyle {
 	switch r.Entry.Role {
 	case core.RoleCreator, core.RoleOwner:
-		st = styleOwner
+		return StyleOwner
 	case core.RoleAdmin:
-		st = styleAdmin
+		return StyleAdmin
 	}
 	if r.IsSelf {
-		st = styleSelf
+		return StyleSelf
 	}
-	return st.Render(line)
+	if r.Online {
+		return StyleOnline
+	}
+	return StyleOffline
 }
 
 func msTime(ms int64) time.Time {
@@ -176,17 +161,14 @@ func msTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
-// RenderBannedLines 渲染黑名单行（群管面板）。
+// RenderBannedLines 渲染黑名单行（群管面板）。styled 参数保留兼容旧签名，
+// v19 起不再内嵌色码（着色由 ViewLine.Style=StyleBad 在快照侧表达）。
 func RenderBannedLines(banned []core.BlacklistEntry, now time.Time, styled bool) []string {
 	out := make([]string, 0, len(banned))
 	sort.SliceStable(banned, func(i, j int) bool { return banned[i].TS > banned[j].TS })
 	for _, b := range banned {
-		line := fmt.Sprintf("x %-22s kicked %s by proof(sig_alg=%s)",
-			ShortID(b.Pub), FormatAge(now.Sub(msTime(b.TS))), string(b.Proof.Alg))
-		if styled {
-			line = styleBad.Render(line)
-		}
-		out = append(out, line)
+		out = append(out, fmt.Sprintf("x %-22s kicked %s by proof(sig_alg=%s)",
+			ShortID(b.Pub), FormatAge(now.Sub(msTime(b.TS))), string(b.Proof.Alg)))
 	}
 	return out
 }
