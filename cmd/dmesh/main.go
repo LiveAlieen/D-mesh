@@ -33,6 +33,7 @@ import (
 	"dmesh/internal/group"
 	"dmesh/internal/identity"
 	"dmesh/internal/store"
+	"dmesh/internal/ui"
 )
 
 // opts 是命令行配置。
@@ -118,6 +119,12 @@ func run(o *opts) error {
 			logger = log.New(lf, "[dmesh] ", log.LstdFlags|log.Lmsgprefix)
 			defer lf.Close()
 		}
+	}
+
+	// 0.5 外置语言目录（v21）：<data>/langs/*.json 叠加进内置 go:embed 词条，
+	//     新文件=新语言、同名文件=覆盖词条——加语言只放文件，不改代码不重编译。
+	if err := ui.LoadLangDir(filepath.Join(o.data, "langs")); err != nil {
+		logger.Printf("langs: %v", err)
 	}
 
 	// 1. 身份密钥（identity 包 import/init 即把 ed25519 验签注册进 core.Register，

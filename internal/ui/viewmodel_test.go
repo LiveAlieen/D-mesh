@@ -597,6 +597,49 @@ func TestVMQuit(t *testing.T) {
 	}
 }
 
+// v22 补做 v18：/progress 双轨进度=系统行进聊天流 + 6·进度 面板渲染，绝不广播。
+func TestVMProgressCommand(t *testing.T) {
+	v, app := newTestVM(t)
+	submit(t, v, "/progress")
+	var versions, milestones, pct bool
+	for _, l := range v.chat {
+		if !l.system {
+			continue
+		}
+		if strings.Contains(l.text, "Version changelog") {
+			versions = true
+		}
+		if strings.Contains(l.text, "Milestones") {
+			milestones = true
+		}
+		if strings.Contains(l.text, "M0") && strings.Contains(l.text, "100%") {
+			pct = true
+		}
+	}
+	if !versions || !milestones || !pct {
+		t.Fatalf("progress lines incomplete: versions=%v milestones=%v pct=%v chat=%+v", versions, milestones, pct, v.chat)
+	}
+	if app.has("SendText:/progress") || app.has("SendText") {
+		// 同测试内 submit 的其他命令不涉及，这里只禁 /progress 被当发言。
+		for _, c := range app.calls {
+			if strings.HasPrefix(c, "SendText:") && strings.Contains(c, "progress") {
+				t.Fatalf("/progress leaked into chat broadcast: %v", app.calls)
+			}
+		}
+	}
+	// 面板渲染同一数据。
+	v.setPanel(PanelProgress)
+	var inPanel bool
+	for _, l := range v.Snapshot() {
+		if strings.Contains(l.Text, "100%") {
+			inPanel = true
+		}
+	}
+	if !inPanel {
+		t.Fatal("progress panel must render the same milestones")
+	}
+}
+
 func TestVMAuditResultsToChat(t *testing.T) {
 	v, _ := newTestVM(t)
 	submit(t, v, "/audit")

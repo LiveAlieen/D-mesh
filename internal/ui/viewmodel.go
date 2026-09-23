@@ -592,13 +592,13 @@ func (v *viewModel) dispatch(c Command) {
 		v.quit = true
 	case CmdLang:
 		if c.Lang == "" {
-			v.setStatus(Tf("st.langNow", string(GetLang())))
+			v.setStatus(Tf("st.langNow", string(GetLang()), LangList()))
 			return
 		}
 		if SetLang(Lang(c.Lang)) {
 			v.setStatus(Tf("st.langSet", string(GetLang())))
 		} else {
-			v.setStatus(Tf("st.langBad", c.Lang))
+			v.setStatus(Tf("st.langBad", c.Lang, LangList()))
 		}
 	case CmdText:
 		msg := v.outboundDraft(c.Text)
@@ -637,6 +637,12 @@ func (v *viewModel) dispatch(c Command) {
 		v.reloadTransfers()
 	case CmdTransfers:
 		v.listTransfers()
+	case CmdProgress:
+		// v18/v22：双轨进度以系统行展示，绝不作为发言广播。
+		for _, l := range ProgressLines() {
+			v.appendChat(chatLine{text: l, system: true})
+		}
+		v.setStatus(Tr("st.progressShown"))
 	case CmdOfflineAfter:
 		v.fire(Tr("act.presence"), func() error { return v.app.SetOfflineAfter(c.Millis) })
 	case CmdSeedCheck:
@@ -1047,10 +1053,16 @@ func (v *viewModel) Snapshot() []ViewLine {
 	case PanelNetdisk:
 		return v.netdiskSnapshot()
 	case PanelProgress:
-		return []ViewLine{
-			{Text: Tr("p.progress.title"), Style: StyleHeader},
-			{Text: Tr("p.progress.note"), Style: StyleDim},
+		lines := ProgressLines()
+		out := make([]ViewLine, 0, len(lines))
+		for _, l := range lines {
+			st := StyleDim
+			if !strings.HasPrefix(l, " ") {
+				st = StyleHeader
+			}
+			out = append(out, ViewLine{Text: l, Style: st})
 		}
+		return out
 	}
 	return nil
 }

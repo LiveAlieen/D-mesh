@@ -886,6 +886,11 @@ func (n *node) headlessCommands(ctx context.Context) {
 			for _, p := range n.PendingTransfers() {
 				fmt.Fprintf(os.Stdout, "%s\n", ui.FormatTransferLine(p, time.Now()))
 			}
+		case ui.CmdProgress:
+			// v18/v22 双轨进度：stdout 系统输出，绝不进发言流。
+			for _, l := range ui.ProgressLines() {
+				fmt.Fprintf(os.Stdout, "[progress] %s\n", l)
+			}
 		case ui.CmdKick:
 			err = n.Kick(c.Target)
 		case ui.CmdUnban:

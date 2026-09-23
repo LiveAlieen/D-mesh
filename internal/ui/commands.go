@@ -29,6 +29,7 @@ const (
 	CmdApprove      // /approve <msg_id|latest|前缀> 联署并广播 transfer 提案（v17①）
 	CmdDeny         // /deny <msg_id|...> 拒绝 transfer 提案（丢弃，绝不转发）
 	CmdTransfers    // /transfers 列出发给本机的待决 transfer 提案
+	CmdProgress     // /progress 进度双轨制：版本迭代 changelog + M0~M6 完成度（v18 设计、v22 落地）
 	CmdOfflineAfter // /offline-after <ms> 本人自报在场阈值（v13.1）
 	CmdSeedCheck    // /seedcheck <path> 核对种子文件哈希与创世配置（M3 入群前提）
 	CmdNetdisk      // /netdisk 打开面板
@@ -37,7 +38,7 @@ const (
 	CmdNDDownload   // /netdisk download <name>
 	CmdNDDelete     // /netdisk delete <name>
 	CmdNDSet        // /netdisk set <MB> 签 netdisk 事件改配额
-	CmdLang         // /lang zh|en 切换界面语言（v20，仅 GUI 生效）
+	CmdLang         // /lang <code> 切换界面语言（v20；v21 起语言集合由语言文件驱动，仅 GUI 生效）
 )
 
 // Command 是解析结果：Kind + 按类别有效的参数字段。
@@ -113,6 +114,8 @@ func ParseCommand(line string) (Command, error) {
 		return Command{Kind: CmdDeny, MsgID: rest}, nil
 	case "transfers":
 		return Command{Kind: CmdTransfers}, nil
+	case "progress":
+		return Command{Kind: CmdProgress}, nil
 	case "offline-after":
 		return parseOfflineAfter(rest)
 	case "seedcheck":
