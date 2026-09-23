@@ -7,12 +7,20 @@ package ui
 
 import (
 	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"dmesh/internal/core"
 )
+
+// TestMain 把界面语言钉为 en：测试断言以 v19 英文字面为基准（v20 i18n 起
+// 本机系统语言若是 zh 会默认中文，故显式钉住；语言目录本身由 i18n_test 验）。
+func TestMain(m *testing.M) {
+	SetLang(LangEn)
+	os.Exit(m.Run())
+}
 
 // ---- 测试替身 ----
 

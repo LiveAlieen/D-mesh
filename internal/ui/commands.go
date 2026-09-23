@@ -37,12 +37,14 @@ const (
 	CmdNDDownload   // /netdisk download <name>
 	CmdNDDelete     // /netdisk delete <name>
 	CmdNDSet        // /netdisk set <MB> 签 netdisk 事件改配额
+	CmdLang         // /lang zh|en 切换界面语言（v20，仅 GUI 生效）
 )
 
 // Command 是解析结果：Kind + 按类别有效的参数字段。
 type Command struct {
 	Kind   CmdKind
 	Text   string      // CmdText
+	Lang   string      // CmdLang（""=查询当前语言）
 	MsgID  string      // CmdHide / CmdApprove / CmdDeny（提案以 msg_id 为键）
 	Target core.PubKey // kick/unban/perms/grant/revoke/transfer
 	Perms  []string    // CmdPerms
@@ -120,6 +122,8 @@ func ParseCommand(line string) (Command, error) {
 		return Command{Kind: CmdSeedCheck, Path: rest}, nil
 	case "netdisk", "nd":
 		return parseNetdisk(s, rest)
+	case "lang":
+		return Command{Kind: CmdLang, Lang: strings.ToLower(rest)}, nil
 	default:
 		return Command{}, fmt.Errorf("unknown command %q (try /help)", "/"+name)
 	}

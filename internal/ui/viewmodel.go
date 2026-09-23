@@ -33,14 +33,14 @@ const (
 )
 
 func (p Panel) label() string {
-	if p >= 0 && int(p) < len(panelNames) {
-		return panelNames[p]
+	if p >= 0 && int(p) < len(panelKeys) {
+		return Tr("panel." + panelKeys[p])
 	}
 	return "?"
 }
 
-// panelNames 与 Panel 枚举一一对应（tab 循环顺序）。
-var panelNames = [panelCount]string{"chat", "members", "join", "admin", "netdisk", "progress"}
+// panelKeys 与 Panel 枚举一一对应（i18n 键后缀与 tab 循环顺序，v20）。
+var panelKeys = [panelCount]string{"chat", "members", "join", "admin", "netdisk", "progress"}
 
 // ---- 视图行（viewModel → game 的绘制指令，不含任何框架类型）----
 
@@ -62,8 +62,12 @@ const (
 )
 
 // ViewLine 是一行待绘制文本。Selected 标记列表选中行（高亮底色）。
+// Meta/Body 为 v20 聊天气泡加分项：Meta=发送者+时间小字行，Body=气泡正文；
+// 两者为空时渲染层回退整行 Text（旧行为，测试断言仍以 Text 为准）。
 type ViewLine struct {
 	Text     string
+	Meta     string
+	Body     string
 	Style    LineStyle
 	Selected bool
 }
@@ -100,6 +104,8 @@ type chatLine struct {
 	hidden bool
 	system bool
 	sender core.PubKey // 入站/出站发送者（StyleSelf 判定用）
+	meta   string      // v20：气泡上方小字行（时间 · 发送者）
+	body   string      // v20：气泡正文（不含发送者前缀）
 }
 
 // promptState 是面板里的单行输入提示（/perms 目标、种子路径等）。
@@ -165,35 +171,53 @@ func (v *viewModel) QuitRequested() bool { return v.quit }
 func (v *viewModel) OnEvent(ev Event) {
 	switch e := ev.(type) {
 	case TextEvent:
-		v.appendChat(chatLine{text: FormatChatLine(e.Msg), msgID: e.Msg.MsgID, sender: e.Msg.Sender})
+		v.appendChat(chatLine{text: FormatChatLine(e.Msg), msgID: e.Msg.MsgID, sender: e.Msg.Sender,
+			meta: chatMeta(e.Msg), body: chatBody(e.Msg)})
 	case AppealEvent:
 		v.appeals = append(v.appeals, e.Msg)
-		v.setStatus("new appeal from %s (admin panel)", ShortID(e.Msg.Sender))
+		v.setStatus(Tf("ev.appeal", ShortID(e.Msg.Sender)))
 	case SystemEvent:
 		v.appendChat(chatLine{text: "· " + e.Note, system: true})
 	case RosterEvent:
 		v.refreshRoster()
 		if e.Note != "" {
-			v.appendChat(chatLine{text: "· roster: " + e.Note, system: true})
+			v.appendChat(chatLine{text: Tf("ev.roster", e.Note), system: true})
 		}
 	case JoinReqEvent:
 		v.upsertJoinReq(e.Req)
-		v.setStatus("new join_req from %s (tab to join panel)", ShortID(e.Req.Msg.Sender))
+		v.setStatus(Tf("ev.joinreq", ShortID(e.Req.Msg.Sender)))
 	case TransferProposalEvent:
 		v.upsertTransfer(e.Prop)
-		v.appendChat(chatLine{text: "· transfer proposal from " + ShortID(e.Prop.Msg.Sender) +
-			" — admin panel (a/d) or /approve " + e.Prop.Msg.MsgID + " | /deny " + e.Prop.Msg.MsgID, system: true})
-		v.setStatus("transfer proposal from %s (admin panel / approve with /approve)", ShortID(e.Prop.Msg.Sender))
+		v.appendChat(chatLine{text: Tf("ev.xferChat", ShortID(e.Prop.Msg.Sender), e.Prop.Msg.MsgID, e.Prop.Msg.MsgID), system: true})
+		v.setStatus(Tf("ev.xferStatus", ShortID(e.Prop.Msg.Sender)))
 	case HideEvent:
 		v.hideLine(e.MsgID)
 	case NetdiskEvent:
-		v.appendChat(chatLine{text: "· netdisk: " + e.Note, system: true})
+		v.appendChat(chatLine{text: Tf("ev.netdisk", e.Note), system: true})
 		if v.panel == PanelNetdisk {
 			v.refreshNetdisk()
 		}
 	case nil:
 		v.quit = true
 	}
+}
+
+// chatMeta/chatBody 把一条消息拆成 v20 气泡的「小字头 + 正文」两部分。
+func chatMeta(m core.Message) string {
+	ts := msTime(m.TSms).Format("15:04:05")
+	dir := ""
+	if m.To != nil {
+		dir = " →" + ShortID(*m.To)
+	}
+	return ts + " · " + ShortID(m.Sender) + dir
+}
+
+func chatBody(m core.Message) string {
+	body := strings.ToValidUTF8(string(m.Content), "\uFFFD")
+	if m.Type != core.TypeText {
+		body = "(" + m.Type + ") " + body
+	}
+	return body
 }
 
 func (v *viewModel) upsertJoinReq(req JoinRequest) {
@@ -285,7 +309,7 @@ func (v *viewModel) refreshNetdisk() {
 	if st, err := nd.Status(); err == nil {
 		v.ndStatus = &st
 	} else {
-		v.setStatus("netdisk status: %v", err)
+		v.setStatus(Tf("ev.ndStatusErr", err))
 	}
 	if fs, err := nd.List(); err == nil {
 		v.ndFiles = fs
@@ -546,7 +570,7 @@ func (v *viewModel) Submit() {
 	}
 	cmd, err := ParseCommand(line)
 	if err != nil {
-		v.setStatus("input error: %v", err)
+		v.setStatus(Tf("st.inputErr", err))
 		return
 	}
 	v.dispatch(cmd)
@@ -556,66 +580,77 @@ func (v *viewModel) Submit() {
 
 func (v *viewModel) dispatch(c Command) {
 	if c.Kind == CmdText && !v.hasPerm(core.PermSpeak) {
-		v.setStatus("no speak permission on this group (or not a member)")
+		v.setStatus(Tr("st.noSpeak"))
 		return
 	}
 	switch c.Kind {
 	case CmdHelp:
-		v.appendChat(chatLine{text: helpText, system: true})
+		v.appendChat(chatLine{text: Tr("help.text"), system: true})
 	case CmdClear:
 		v.chat, v.chatScroll = nil, 0
 	case CmdQuit:
 		v.quit = true
+	case CmdLang:
+		if c.Lang == "" {
+			v.setStatus(Tf("st.langNow", string(GetLang())))
+			return
+		}
+		if SetLang(Lang(c.Lang)) {
+			v.setStatus(Tf("st.langSet", string(GetLang())))
+		} else {
+			v.setStatus(Tf("st.langBad", c.Lang))
+		}
 	case CmdText:
-		v.appendChat(chatLine{text: FormatChatLine(v.outboundDraft(c.Text)), sender: v.selfPub()})
-		v.fire("sent", func() error { return v.app.SendText(c.Text) })
+		msg := v.outboundDraft(c.Text)
+		v.appendChat(chatLine{text: FormatChatLine(msg), sender: v.selfPub(), meta: chatMeta(msg), body: chatBody(msg)})
+		v.fire(Tr("act.sent"), func() error { return v.app.SendText(c.Text) })
 	case CmdHide:
 		v.hideLine(c.MsgID)
-		v.fire("hide", func() error { return v.app.Hide(c.MsgID) })
+		v.fire(Tr("act.hide"), func() error { return v.app.Hide(c.MsgID) })
 	case CmdAudit:
 		v.audit()
 	case CmdRemove:
-		v.fire("remove(leave) signed", func() error { return v.app.Leave() })
+		v.fire(Tr("act.leave"), func() error { return v.app.Leave() })
 	case CmdKick:
-		v.fire("kick", func() error { return v.app.Kick(c.Target) })
+		v.fire(Tr("act.kick"), func() error { return v.app.Kick(c.Target) })
 	case CmdUnban:
-		v.fire("unban", func() error { return v.app.Unban(c.Target) })
+		v.fire(Tr("act.unban"), func() error { return v.app.Unban(c.Target) })
 	case CmdPerms:
-		v.fire("perms", func() error { return v.app.SetPerms(c.Target, c.Perms) })
+		v.fire(Tr("act.perms"), func() error { return v.app.SetPerms(c.Target, c.Perms) })
 	case CmdGrantAdmin:
-		v.fire("grant_admin", func() error { return v.app.GrantAdmin(c.Target) })
+		v.fire(Tr("act.grantAdmin"), func() error { return v.app.GrantAdmin(c.Target) })
 	case CmdRevokeAdmin:
-		v.fire("revoke_admin", func() error { return v.app.RevokeAdmin(c.Target) })
+		v.fire(Tr("act.revokeAdmin"), func() error { return v.app.RevokeAdmin(c.Target) })
 	case CmdTransfer:
-		v.fire("transfer event (needs new owner endorse)", func() error { return v.app.Transfer(c.Target) })
+		v.fire(Tr("act.transfer"), func() error { return v.app.Transfer(c.Target) })
 	case CmdApprove:
-		v.fire("transfer endorsed & broadcast", func() error { return v.app.ApproveTransfer(c.MsgID) })
+		v.fire(Tr("act.endorsed"), func() error { return v.app.ApproveTransfer(c.MsgID) })
 	case CmdDeny:
 		if v.app == nil {
 			return
 		}
 		if err := v.app.RejectTransfer(c.MsgID); err != nil {
-			v.setStatus("deny failed: %v", err)
+			v.setStatus(Tf("st.denyFail", err))
 			return
 		}
-		v.appendChat(chatLine{text: "· transfer proposal " + truncate(c.MsgID, 10) + " denied (dropped locally, never forwarded)", system: true})
+		v.appendChat(chatLine{text: Tf("act.deniedLine", truncate(c.MsgID, 10)), system: true})
 		v.reloadTransfers()
 	case CmdTransfers:
 		v.listTransfers()
 	case CmdOfflineAfter:
-		v.fire("presence threshold update", func() error { return v.app.SetOfflineAfter(c.Millis) })
+		v.fire(Tr("act.presence"), func() error { return v.app.SetOfflineAfter(c.Millis) })
 	case CmdSeedCheck:
 		v.seedCheck(c.Path, core.PubKey{})
 	case CmdNetdisk, CmdNDStatus:
 		v.setPanel(PanelNetdisk)
 	case CmdNDUpload:
-		v.ndFire(func(nd Netdisk) error { return nd.Upload(c.Path) }, "upload "+c.Path)
+		v.ndFire(func(nd Netdisk) error { return nd.Upload(c.Path) }, Tf("act.upload", c.Path))
 	case CmdNDDownload:
-		v.ndFire(func(nd Netdisk) error { return nd.Download(c.Name, c.Name) }, "download "+c.Name)
+		v.ndFire(func(nd Netdisk) error { return nd.Download(c.Name, c.Name) }, Tf("act.download", c.Name))
 	case CmdNDDelete:
-		v.ndFire(func(nd Netdisk) error { return nd.Delete(c.Name) }, "delete "+c.Name)
+		v.ndFire(func(nd Netdisk) error { return nd.Delete(c.Name) }, Tf("act.delete", c.Name))
 	case CmdNDSet:
-		v.fire(fmt.Sprintf("netdisk quota -> %d MB", c.MB), func() error { return v.app.SetNetdiskMB(c.MB) })
+		v.fire(Tf("act.ndQuota", c.MB), func() error { return v.app.SetNetdiskMB(c.MB) })
 	}
 }
 
@@ -627,15 +662,15 @@ func (v *viewModel) listTransfers() {
 	v.async(func() []Event {
 		props := app.PendingTransfers()
 		if len(props) == 0 {
-			return []Event{SystemEvent{Note: "transfer proposals: none pending"}}
+			return []Event{SystemEvent{Note: Tr("lf.none")}}
 		}
 		now := v.currentTime()
 		var b strings.Builder
-		fmt.Fprintf(&b, "transfer proposals (%d):\n", len(props))
+		fmt.Fprintf(&b, "%s\n", Tf("lf.title", len(props)))
 		for _, p := range props {
 			b.WriteString("  " + FormatTransferLine(p, now) + "\n")
 		}
-		b.WriteString("  /approve <msg_id|latest|唯一前缀> · /deny <same>")
+		b.WriteString(Tr("lf.hint"))
 		return []Event{SystemEvent{Note: strings.TrimRight(b.String(), "\n")}}
 	})
 }
@@ -648,11 +683,11 @@ func (v *viewModel) audit() {
 	v.async(func() []Event {
 		lines, err := app.Audit()
 		if err != nil {
-			return []Event{SystemEvent{Note: "audit failed: " + err.Error()}}
+			return []Event{SystemEvent{Note: Tf("au.failed", err.Error())}}
 		}
 		evs := make([]Event, 0, len(lines))
 		for _, l := range lines {
-			evs = append(evs, SystemEvent{Note: "audit: " + l})
+			evs = append(evs, SystemEvent{Note: Tf("au.line", l)})
 		}
 		return evs
 	})
@@ -679,9 +714,9 @@ func (v *viewModel) fire(desc string, job func() error) {
 	}
 	v.async(func() []Event {
 		if err := job(); err != nil {
-			return []Event{SystemEvent{Note: desc + " failed: " + err.Error()}}
+			return []Event{SystemEvent{Note: Tf("act.failed", desc, err)}}
 		}
-		return []Event{SystemEvent{Note: desc + " submitted"}}
+		return []Event{SystemEvent{Note: Tf("act.submitted", desc)}}
 	})
 }
 
@@ -689,7 +724,7 @@ func (v *viewModel) fire(desc string, job func() error) {
 func (v *viewModel) ndFire(fn func(Netdisk) error, desc string) {
 	nd := mustND(v.app)
 	if nd == nil {
-		v.setStatus("netdisk not available (quota 0 or backend not wired)")
+		v.setStatus(Tr("st.ndUnavailable"))
 		return
 	}
 	v.fire(desc, func() error { return fn(nd) })
@@ -721,7 +756,7 @@ func (v *viewModel) seedCheck(path string, applicant core.PubKey) {
 	v.async(func() []Event {
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return []Event{SystemEvent{Note: "seedcheck: " + err.Error()}}
+			return []Event{SystemEvent{Note: Tf("sc.err", err.Error())}}
 		}
 		var want [32]byte
 		if app != nil {
@@ -729,16 +764,15 @@ func (v *viewModel) seedCheck(path string, applicant core.PubKey) {
 		}
 		cfg, match, err := CheckSeedBytes(raw, want)
 		if err != nil {
-			return []Event{SystemEvent{Note: "seedcheck REJECTED: " + err.Error()}}
+			return []Event{SystemEvent{Note: Tf("sc.rejected", err.Error())}}
 		}
 		if !match {
-			return []Event{SystemEvent{Note: "seedcheck: valid seed (" + cfg.Name + ") but NOT this group"}}
+			return []Event{SystemEvent{Note: Tf("sc.wrongGroup", cfg.Name)}}
 		}
 		if applicant.IsZero() {
-			return []Event{SystemEvent{Note: "seedcheck OK: " + cfg.Name + " (mode=" + cfg.Mode + ")"}}
+			return []Event{SystemEvent{Note: Tf("sc.ok", cfg.Name, cfg.Mode)}}
 		}
-		return []Event{SystemEvent{Note: fmt.Sprintf("seedcheck OK for req from %s: group=%s mode=%s — press a to sign join",
-			ShortID(applicant), cfg.Name, cfg.Mode)}}
+		return []Event{SystemEvent{Note: Tf("sc.okReq", ShortID(applicant), cfg.Name, cfg.Mode)}}
 	})
 }
 
@@ -823,18 +857,18 @@ func (v *viewModel) joinAction(key string) {
 	switch key {
 	case "a": // 核对通过后签 join 广播
 		if !req.SeedOK {
-			v.setStatus("seed hash not verified for %s — press s to check the seed file first", ShortID(req.Msg.Sender))
+			v.setStatus(Tf("st.seedGate", ShortID(req.Msg.Sender)))
 			return
 		}
-		v.fire("join signed & broadcast", func() error { return v.app.ApproveJoin(req.Msg.MsgID) })
+		v.fire(Tr("act.joinSigned"), func() error { return v.app.ApproveJoin(req.Msg.MsgID) })
 	case "d": // 拒绝（仅本地出队，不广播）
 		if err := v.app.RejectJoin(req.Msg.MsgID); err != nil {
-			v.setStatus("reject failed: %v", err)
+			v.setStatus(Tf("st.rejectFail", err))
 		} else {
 			v.reloadJoins()
 		}
 	case "s": // 核对种子文件哈希（申请人递交或线下拿到的种子路径）
-		v.prompt = &promptState{label: "seed file path to verify", action: "seedcheck", target: req.Msg.Sender}
+		v.prompt = &promptState{label: Tr("prompt.seedPath"), action: "seedcheck", target: req.Msg.Sender}
 	case "r":
 		v.reloadJoins()
 	}
@@ -857,33 +891,33 @@ func (v *viewModel) adminAction(key string) {
 	switch {
 	case key == "K" && kind == "member":
 		pub := v.members[v.sel].Entry.Pub
-		v.fire("kick event", func() error { return v.app.Kick(pub) })
+		v.fire(Tr("act.kickEvent"), func() error { return v.app.Kick(pub) })
 	case key == "U" && kind == "banned":
 		pub := v.banned[v.sel-sec.m].Pub
-		v.fire("unban event", func() error { return v.app.Unban(pub) })
+		v.fire(Tr("act.unbanEvent"), func() error { return v.app.Unban(pub) })
 	case key == "P" && kind == "member":
 		pub := v.members[v.sel].Entry.Pub
-		v.prompt = &promptState{label: "new perms for " + ShortID(pub) + " (csv)", action: "perms", target: pub}
+		v.prompt = &promptState{label: Tf("prompt.permsFor", ShortID(pub)), action: "perms", target: pub}
 	case key == "G" && kind == "member":
 		pub := v.members[v.sel].Entry.Pub
-		v.fire("grant_admin event", func() error { return v.app.GrantAdmin(pub) })
+		v.fire(Tr("act.grantAdminEvent"), func() error { return v.app.GrantAdmin(pub) })
 	case key == "R" && kind == "member":
 		pub := v.members[v.sel].Entry.Pub
-		v.fire("revoke_admin event", func() error { return v.app.RevokeAdmin(pub) })
+		v.fire(Tr("act.revokeAdminEvent"), func() error { return v.app.RevokeAdmin(pub) })
 	case key == "T" && kind == "member":
 		pub := v.members[v.sel].Entry.Pub
-		v.fire("transfer event (needs new owner endorse)", func() error { return v.app.Transfer(pub) })
+		v.fire(Tr("act.transfer"), func() error { return v.app.Transfer(pub) })
 	case key == "a" && kind == "transfer":
 		v.transferAction(v.transfers[v.sel-sec.m-sec.b])
 	case key == "d" && kind == "transfer":
 		v.denyTransfer(v.transfers[v.sel-sec.m-sec.b])
 	case key == "u" && kind == "appeal":
 		msg := v.appeals[v.sel-sec.m-sec.b-sec.t]
-		v.fire("unban event", func() error { return v.app.Unban(msg.Sender) })
+		v.fire(Tr("act.unbanEvent"), func() error { return v.app.Unban(msg.Sender) })
 	case key == "i" && kind == "appeal":
 		i := v.sel - sec.m - sec.b - sec.t
 		v.appeals = append(v.appeals[:i:i], v.appeals[i+1:]...)
-		v.setStatus("appeal ignored (kept in log only)")
+		v.setStatus(Tr("st.appealIgnored"))
 		v.moveSel(0)
 	}
 }
@@ -892,19 +926,19 @@ func (v *viewModel) adminAction(key string) {
 // 联署（EndorseSig）并广播生效；签名者非现任 owner/创建者时拒绝联署。
 func (v *viewModel) transferAction(prop TransferProposal) {
 	if !prop.FromOwner {
-		v.setStatus("proposal signer is not current owner/creator — refusing to endorse")
+		v.setStatus(Tr("st.notOwner"))
 		return
 	}
-	v.fire("transfer endorsed & broadcast", func() error { return v.app.ApproveTransfer(prop.Msg.MsgID) })
+	v.fire(Tr("act.endorsed"), func() error { return v.app.ApproveTransfer(prop.Msg.MsgID) })
 }
 
 // denyTransfer 拒绝提案：宿主仅本地丢弃，绝不转发、不产生任何事件。
 func (v *viewModel) denyTransfer(prop TransferProposal) {
 	if err := v.app.RejectTransfer(prop.Msg.MsgID); err != nil {
-		v.setStatus("deny failed: %v", err)
+		v.setStatus(Tf("st.denyFail", err))
 		return
 	}
-	v.appendChat(chatLine{text: "· transfer proposal " + truncate(prop.Msg.MsgID, 10) + " denied (dropped locally, never forwarded)", system: true})
+	v.appendChat(chatLine{text: Tf("act.deniedLine", truncate(prop.Msg.MsgID, 10)), system: true})
 	v.reloadTransfers()
 }
 
@@ -918,7 +952,7 @@ func (v *viewModel) onPromptKey(k Key) {
 		v.runPrompt(p)
 	case KeyEscape:
 		v.prompt = nil
-		v.setStatus("cancelled")
+		v.setStatus(Tr("st.cancelled"))
 	case KeyBackspace:
 		r := []rune(p.value)
 		if len(r) > 0 {
@@ -930,7 +964,7 @@ func (v *viewModel) onPromptKey(k Key) {
 func (v *viewModel) runPrompt(p *promptState) {
 	val := strings.TrimSpace(p.value)
 	if val == "" {
-		v.setStatus("empty input, cancelled")
+		v.setStatus(Tr("st.emptyCancelled"))
 		return
 	}
 	switch p.action {
@@ -939,13 +973,13 @@ func (v *viewModel) runPrompt(p *promptState) {
 	case "perms":
 		perms, err := ParsePermList(val)
 		if err != nil {
-			v.setStatus("perms error: %v", err)
+			v.setStatus(Tf("st.permsErr", err))
 			return
 		}
 		if v.app == nil {
 			return
 		}
-		v.fire("perms event", func() error { return v.app.SetPerms(p.target, perms) })
+		v.fire(Tr("act.permsEvent"), func() error { return v.app.SetPerms(p.target, perms) })
 	}
 }
 
@@ -965,15 +999,14 @@ func (v *viewModel) TopLine() string {
 			online++
 		}
 	}
-	return fmt.Sprintf("me=%s · group=%s · members=%d(online %d) · banned=%d · joins=%d · panel=%s",
-		self, gid, len(v.members), online, len(v.banned), len(v.joinReqs), v.panel.label())
+	return Tf("top.line", self, gid, len(v.members), online, len(v.banned), len(v.joinReqs), v.panel.label())
 }
 
-// TabLabels 返回顶部标签页文字（与 SwitchTab 序号一致）。
+// TabLabels 返回顶部标签页文字（与 SwitchTab 序号一致；v20 起随语言变化）。
 func TabLabels() []string {
 	out := make([]string, 0, panelCount)
 	for i := 0; i < int(panelCount); i++ {
-		out = append(out, fmt.Sprintf("%d:%s", i+1, panelNames[i]))
+		out = append(out, fmt.Sprintf("%d·%s", i+1, Panel(i).label()))
 	}
 	return out
 }
@@ -989,7 +1022,7 @@ func (v *viewModel) InputLine() (text string, caret int, active bool) {
 	if v.panel == PanelChat || v.inputFocus {
 		return "> " + string(v.input), v.cur + 2, true
 	}
-	return "> " + string(v.input) + "  (list focus: keys act on selection · Enter=/ edits)", v.cur + 2, false
+	return Tf("input.listFocus", "> "+string(v.input)), v.cur + 2, false
 }
 
 // StatusLine 返回底部状态行。
@@ -997,7 +1030,7 @@ func (v *viewModel) StatusLine() string {
 	if v.status != "" {
 		return v.status
 	}
-	return fmt.Sprintf("tab=switch panel [%s] · 1..6 jump · esc=chat · close window quits · /help for commands", v.panel.label())
+	return Tf("status.hint", v.panel.label())
 }
 
 // Snapshot 返回当前面板的可视行（不含 header/input/status，由 game 布局）。
@@ -1015,8 +1048,8 @@ func (v *viewModel) Snapshot() []ViewLine {
 		return v.netdiskSnapshot()
 	case PanelProgress:
 		return []ViewLine{
-			{Text: "v18 /progress 欠账挂账，待补做", Style: StyleHeader},
-			{Text: "进度双轨制（PLAN v18）：设计已定稿，代码未落地 —— 本面板为 v19 预留占位。", Style: StyleDim},
+			{Text: Tr("p.progress.title"), Style: StyleHeader},
+			{Text: Tr("p.progress.note"), Style: StyleDim},
 		}
 	}
 	return nil
@@ -1035,16 +1068,16 @@ func (v *viewModel) chatSnapshot() []ViewLine {
 		case !l.sender.IsZero() && v.app != nil && l.sender.Equal(v.app.Self()):
 			st = StyleSelf
 		}
-		out = append(out, ViewLine{Text: l.text, Style: st})
+		out = append(out, ViewLine{Text: l.text, Meta: l.meta, Body: l.body, Style: st})
 	}
 	return out
 }
 
 func (v *viewModel) membersSnapshot() []ViewLine {
 	v.refreshRoster()
-	out := []ViewLine{{Text: "members — 在线/离线/最后活跃（v13.1，本面板只读）", Style: StyleHeader}}
+	out := []ViewLine{{Text: Tr("p.members.header"), Style: StyleHeader}}
 	if len(v.members) == 0 {
-		out = append(out, ViewLine{Text: "(no members)", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.members.empty"), Style: StyleDim})
 		return out
 	}
 	for i, l := range RenderMemberLines(v.members, v.currentTime()) {
@@ -1054,9 +1087,9 @@ func (v *viewModel) membersSnapshot() []ViewLine {
 }
 
 func (v *viewModel) joinSnapshot() []ViewLine {
-	out := []ViewLine{{Text: "join_req queue（carry 权限者签 join；申请人自签永远无效）", Style: StyleHeader}}
+	out := []ViewLine{{Text: Tr("p.join.header"), Style: StyleHeader}}
 	if len(v.joinReqs) == 0 {
-		out = append(out, ViewLine{Text: "  (empty)", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.empty"), Style: StyleDim})
 	}
 	for i, req := range v.joinReqs {
 		st := StyleChat
@@ -1066,7 +1099,7 @@ func (v *viewModel) joinSnapshot() []ViewLine {
 		out = append(out, ViewLine{Text: FormatJoinLine(req, v.currentTime()), Style: st, Selected: i == v.sel})
 	}
 	if len(v.joinReqs) > 0 {
-		out = append(out, ViewLine{Text: "  a=approve(sign join) d=deny s=check seed file · seed must hash-match genesis (creator-signed only)", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.join.hint"), Style: StyleDim})
 	}
 	return out
 }
@@ -1075,18 +1108,18 @@ func (v *viewModel) adminSnapshot() []ViewLine {
 	v.refreshRoster()
 	v.reloadTransfers()
 	sec := v.adminSec()
-	out := []ViewLine{{Text: "members (K=kick P=perms G=grant-admin R=revoke-admin T=transfer)", Style: StyleHeader}}
+	out := []ViewLine{{Text: Tr("p.admin.members"), Style: StyleHeader}}
 	for i, l := range RenderMemberLines(v.members, v.currentTime()) {
 		out = append(out, ViewLine{Text: l, Style: memberLineStyle(v.members[i]), Selected: i == v.sel})
 	}
-	out = append(out, ViewLine{Text: "blacklist (kicked — appeal channel only reaches unban-authorized members; U=unban)", Style: StyleBad})
+	out = append(out, ViewLine{Text: Tr("p.admin.banned"), Style: StyleBad})
 	for i, l := range RenderBannedLines(v.banned, v.currentTime(), false) {
 		out = append(out, ViewLine{Text: l, Style: StyleBad, Selected: sec.m+i == v.sel})
 	}
 	// transfer 联署提案节（v17①，v19 起落在群管面板）。
-	out = append(out, ViewLine{Text: "transfer proposals addressed to me (a=endorse+broadcast, d=deny)", Style: StyleHeader})
+	out = append(out, ViewLine{Text: Tr("p.admin.xfers"), Style: StyleHeader})
 	if len(v.transfers) == 0 {
-		out = append(out, ViewLine{Text: "  (empty)", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.empty"), Style: StyleDim})
 	}
 	for i, prop := range v.transfers {
 		st := StyleBad
@@ -1096,12 +1129,12 @@ func (v *viewModel) adminSnapshot() []ViewLine {
 		out = append(out, ViewLine{Text: FormatTransferLine(prop, v.currentTime()), Style: st, Selected: sec.m+sec.b+i == v.sel})
 	}
 	if len(v.transfers) > 0 {
-		out = append(out, ViewLine{Text: "  a=endorse the exact proposal & broadcast d=drop (never forwarded) · green signer = current owner/creator", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.admin.xferHint"), Style: StyleDim})
 	}
 	// 黑名单定向申诉节。
-	out = append(out, ViewLine{Text: "directed appeals from blacklisted members (u=sign unban, i=ignore)", Style: StyleHeader})
+	out = append(out, ViewLine{Text: Tr("p.admin.appeals"), Style: StyleHeader})
 	if len(v.appeals) == 0 {
-		out = append(out, ViewLine{Text: "  (none)", Style: StyleDim})
+		out = append(out, ViewLine{Text: Tr("p.none"), Style: StyleDim})
 	}
 	for i, a := range v.appeals {
 		out = append(out, ViewLine{Text: FormatChatLine(a), Style: StyleChat, Selected: sec.m+sec.b+sec.t+i == v.sel})
@@ -1113,18 +1146,18 @@ func (v *viewModel) netdiskSnapshot() []ViewLine {
 	v.refreshNetdisk()
 	if v.ndStatus == nil {
 		return []ViewLine{
-			{Text: "netdisk_mb=0 关闭（或后端未接线）— owner/creator 可用 /netdisk set <MB> 开启", Style: StyleHeader},
+			{Text: Tr("p.nd.off"), Style: StyleHeader},
 		}
 	}
-	out := []ViewLine{{Text: "netdisk", Style: StyleHeader}}
+	out := []ViewLine{{Text: Tr("p.nd.header"), Style: StyleHeader}}
 	for _, l := range RenderNetdiskLines(*v.ndStatus, v.ndFiles) {
 		st := StyleChat
-		if strings.HasPrefix(l, "!") {
+		if strings.HasPrefix(l, "!") || strings.HasPrefix(l, "！") {
 			st = StyleBad
 		}
 		out = append(out, ViewLine{Text: l, Style: st})
 	}
-	out = append(out, ViewLine{Text: "commands: /netdisk upload <path> · download <name> · delete <name> · set <MB> · r=refresh", Style: StyleDim})
+	out = append(out, ViewLine{Text: Tr("p.nd.cmds"), Style: StyleDim})
 	return out
 }
 
@@ -1163,25 +1196,3 @@ func hex8(b []byte) string {
 	}
 	return string(out)
 }
-
-const helpText = `commands:
-  <text>                     send chat message (speak perm required)
-  /hide <msg_id>             soft-delete a message you sent (hide event)
-  /audit                     on-demand multi-source consistency check
-  /remove                    leave group (self-signed remove; not blacklisted)
-  /kick <pub>                explicit kick event -> member removed + blacklisted
-  /unban <pub>               lift a blacklist entry
-  /perms <pub> <p1,p2,...>   set perms (signer must outrank target)
-  /grant-admin <pub> /revoke-admin <pub> /transfer <pub>
-  /transfers                 list transfer endorsement proposals addressed to me
-  /approve <id|latest>       endorse a transfer proposal (same bytes) + broadcast
-  /deny <id|latest>          drop a transfer proposal (never forwarded)
-  /offline-after <ms>        self presence threshold (v13.1)
-  /seedcheck <path>          verify seed file: recompute group_id + creator_sig
-  /netdisk                   open netdisk panel
-  /netdisk upload <path> | download <name> | delete <name> | set <MB>
-  /help /clear /quit         misc
-  pub forms: ed25519:<hex> or bare <hex> (defaults ed25519)
-panels: tab/shift-tab cycle; chat members join admin netdisk progress
-keys: 1..6 jump · esc=back to chat · up/down/pgup/pgdn=chat scroll ·
-      on list panels keys act on selection, Enter or '/' focuses input`

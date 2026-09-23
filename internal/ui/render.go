@@ -46,17 +46,17 @@ func ShortID(p core.PubKey) string {
 	return string(p.Alg) + ":" + h
 }
 
-// RoleLabel 把角色映射成展示徽章。
+// RoleLabel 把角色映射成展示徽章（v20 起随界面语言本地化）。
 func RoleLabel(r core.Role) string {
 	switch r {
 	case core.RoleCreator:
-		return "creator"
+		return Tr("role.creator")
 	case core.RoleOwner:
-		return "owner"
+		return Tr("role.owner")
 	case core.RoleAdmin:
-		return "admin"
+		return Tr("role.admin")
 	case core.RoleMember:
-		return "member"
+		return Tr("role.member")
 	default:
 		return string(r)
 	}
@@ -117,18 +117,18 @@ func renderMemberLines(rows []MemberRow, now time.Time) []string {
 		var dot, tail string
 		if r.Online {
 			dot = "●"
-			tail = "active " + FormatAge(now.Sub(msTime(r.Presence.LastMsgTS)))
+			tail = Tf("mem.active", FormatAge(now.Sub(msTime(r.Presence.LastMsgTS))))
 		} else {
 			dot = "○"
 			if r.Presence.LastMsgTS == 0 {
-				tail = "offline (never seen)"
+				tail = Tr("mem.never")
 			} else {
-				tail = "offline " + FormatAge(now.Sub(msTime(r.Presence.LastMsgTS)))
+				tail = Tf("mem.offline", FormatAge(now.Sub(msTime(r.Presence.LastMsgTS))))
 			}
 		}
 		name := ShortID(r.Entry.Pub)
 		if r.IsSelf {
-			name += " (me)"
+			name += Tr("mem.me")
 		}
 		out = append(out, fmt.Sprintf("%s %-22s [%s] %-28s %s",
 			dot, name, RoleLabel(r.Entry.Role),
@@ -167,8 +167,7 @@ func RenderBannedLines(banned []core.BlacklistEntry, now time.Time, styled bool)
 	out := make([]string, 0, len(banned))
 	sort.SliceStable(banned, func(i, j int) bool { return banned[i].TS > banned[j].TS })
 	for _, b := range banned {
-		out = append(out, fmt.Sprintf("x %-22s kicked %s by proof(sig_alg=%s)",
-			ShortID(b.Pub), FormatAge(now.Sub(msTime(b.TS))), string(b.Proof.Alg)))
+		out = append(out, Tf("ban.line", ShortID(b.Pub), FormatAge(now.Sub(msTime(b.TS))), string(b.Proof.Alg)))
 	}
 	return out
 }
@@ -193,15 +192,15 @@ func FormatChatLine(m core.Message) string {
 
 // ---- 入群面板 ----
 
-// FormatJoinLine 渲染一条 join_req 队列行。
+// FormatJoinLine 渲染一条 join_req 队列行（v20：文案随语言，msg_id/wg/mode 结构位不动）。
 func FormatJoinLine(req JoinRequest, now time.Time) string {
 	wgs := req.ApplicantWG.String()
 	if len(wgs) > 8 {
 		wgs = wgs[:8]
 	}
-	seed := "seed=unverified"
+	seed := Tr("join.seedBad")
 	if req.SeedOK {
-		seed = "seed=OK"
+		seed = Tr("join.seedOK")
 	}
 	mode := req.Mode
 	if mode == "" {
@@ -209,22 +208,20 @@ func FormatJoinLine(req JoinRequest, now time.Time) string {
 	}
 	note := ""
 	if req.IdentityNote != "" {
-		note = " note=" + truncate(req.IdentityNote, 40)
+		note = Tf("join.note", truncate(req.IdentityNote, 40))
 	}
-	return fmt.Sprintf("req %.10s from %s wg=%s mode=%s %s%s%s",
-		req.Msg.MsgID, ShortID(req.Msg.Sender), wgs, mode, seed, note,
+	return Tf("join.line", req.Msg.MsgID, ShortID(req.Msg.Sender), wgs, mode, seed, note,
 		ageSuffix(req.Msg.TSms, now))
 }
 
 // FormatTransferLine 渲染一条发给本机的 transfer 联署提案行（v17①）：
 // 提案是现任 owner/创建者定向送达、尚缺本机 endorse_sig 的 transfer 原文。
 func FormatTransferLine(prop TransferProposal, now time.Time) string {
-	sig := "signer-unverified!"
+	sig := Tr("xfer.unverified")
 	if prop.FromOwner {
-		sig = "owner/creator"
+		sig = Tr("xfer.owner")
 	}
-	return fmt.Sprintf("xfer %.10s from %s -> me (%s, pending my endorse)%s",
-		prop.Msg.MsgID, ShortID(prop.Msg.Sender), sig,
+	return Tf("xfer.line", prop.Msg.MsgID, ShortID(prop.Msg.Sender), sig,
 		ageSuffix(prop.Msg.TSms, now))
 }
 
@@ -232,39 +229,36 @@ func ageSuffix(ms int64, now time.Time) string {
 	if ms <= 0 {
 		return ""
 	}
-	return " (" + FormatAge(now.Sub(msTime(ms))) + " ago)"
+	return Tf("age.ago", FormatAge(now.Sub(msTime(ms))))
 }
 
 // ---- 网盘面板 ----
 
-// RenderNetdiskLines 渲染网盘总览 + 文件列表（纯文本）。
+// RenderNetdiskLines 渲染网盘总览 + 文件列表（纯文本，v20 起文案随语言）。
 func RenderNetdiskLines(s NetdiskStatus, files []NetdiskFile) []string {
 	out := []string{
-		fmt.Sprintf("quota/member: %d MB   total: %s   used: %s",
-			s.QuotaMB, humanBytes(s.TotalBytes), humanBytes(s.UsedBytes)),
-		fmt.Sprintf("contributors: %d   online-writable: %d   degraded stripes: %d",
-			len(s.Contributors), s.OnlineWritable, s.DegradedStripes),
+		Tf("nd.quota", s.QuotaMB, humanBytes(s.TotalBytes), humanBytes(s.UsedBytes)),
+		Tf("nd.contrib", len(s.Contributors), s.OnlineWritable, s.DegradedStripes),
 	}
 	if s.Note != "" {
-		out = append(out, "note: "+s.Note)
+		out = append(out, Tf("nd.note", s.Note))
 	}
 	if s.DegradedStripes > 0 {
-		out = append(out, "! RAID5 degraded: single-block loss tolerated, rebuilding preferred; writes may pause")
+		out = append(out, Tr("nd.degraded"))
 	}
 	if s.QuotaMB == 0 {
-		out = append(out, "netdisk disabled (netdisk_mb=0). Owner/creator: /netdisk set <MB> (<=256)")
+		out = append(out, Tr("nd.disabled"))
 	}
-	out = append(out, "-- files --")
+	out = append(out, Tr("nd.files"))
 	if len(files) == 0 {
-		out = append(out, "  (empty)")
+		out = append(out, Tr("p.empty"))
 	}
 	for _, f := range files {
-		h := "ok"
+		h := Tr("nd.ok")
 		if !f.Healthy {
-			h = "DEGRADED"
+			h = Tr("nd.degr")
 		}
-		out = append(out, fmt.Sprintf("  %-28s %8s stripes=%d %s",
-			truncate(f.Name, 28), humanBytes(f.Size), f.Stripes, h))
+		out = append(out, Tf("nd.fileLine", truncate(f.Name, 28), humanBytes(f.Size), f.Stripes, h))
 	}
 	return out
 }

@@ -42,40 +42,51 @@ func Run(app App) error {
 // ---- 字体与色板 ----
 
 type fontSet struct {
-	body  *text.GoTextFace
-	small *text.GoTextFace
-	lineH float64 // body 行高（像素）
+	body   *text.GoTextFace
+	small  *text.GoTextFace
+	lineH  float64 // body 行高（像素，含 v20 加宽行距）
+	smallH float64 // small 行高（meta 行/状态行）
 }
 
 func newFontSet(src *text.GoTextFaceSource) *fontSet {
 	body := &text.GoTextFace{Source: src, Size: 15}
 	small := &text.GoTextFace{Source: src, Size: 13}
 	m := body.Metrics()
-	lh := m.HAscent + m.HDescent + m.HLineGap
+	lh := (m.HAscent + m.HDescent + m.HLineGap) * 1.18
 	if lh < 12 {
 		lh = 18
 	}
-	return &fontSet{body: body, small: small, lineH: lh}
+	sm := small.Metrics()
+	sh := sm.HAscent + sm.HDescent + sm.HLineGap
+	if sh < 10 {
+		sh = 16
+	}
+	return &fontSet{body: body, small: small, lineH: lh, smallH: sh}
 }
 
 var (
-	colBG          = color.RGBA{16, 18, 22, 255}
-	colDivider     = color.RGBA{52, 58, 74, 255}
-	colChat        = color.RGBA{220, 224, 232, 255}
-	colSelf        = color.RGBA{255, 196, 120, 255}
-	colSystem      = color.RGBA{140, 146, 160, 255}
-	colHeader      = color.RGBA{96, 165, 250, 255}
-	colDim         = color.RGBA{120, 125, 138, 255}
-	colOnline      = color.RGBA{102, 217, 145, 255}
-	colOffline     = color.RGBA{130, 134, 145, 255}
-	colBad         = color.RGBA{244, 102, 102, 255}
-	colOwner       = color.RGBA{120, 230, 120, 255}
-	colAdmin       = color.RGBA{230, 140, 230, 255}
-	colStatus      = color.RGBA{250, 200, 90, 255}
-	colSelBG       = color.RGBA{40, 48, 66, 255}
-	colBubbleSelf  = color.RGBA{52, 44, 30, 255}
-	colBubbleOther = color.RGBA{28, 32, 42, 255}
-	colCaret       = color.RGBA{250, 250, 250, 255}
+	colBG          = color.RGBA{13, 16, 22, 255} // 深底
+	colBarBG       = color.RGBA{18, 22, 31, 255} // 顶/底状态带
+	colCard        = color.RGBA{24, 29, 41, 255} // 输入框/药丸底
+	colDivider     = color.RGBA{41, 48, 63, 255}
+	colAccent      = color.RGBA{99, 152, 255, 255} // 统一强调色
+	colSelBG       = color.RGBA{38, 50, 76, 255}
+	colRowBG       = color.RGBA{18, 22, 30, 255} // 列表斑马纹
+	colChat        = color.RGBA{223, 227, 235, 255}
+	colSelf        = color.RGBA{255, 203, 135, 255}
+	colSystem      = color.RGBA{133, 140, 156, 255}
+	colHeader      = color.RGBA{122, 178, 255, 255}
+	colDim         = color.RGBA{118, 124, 138, 255}
+	colOnline      = color.RGBA{108, 214, 149, 255}
+	colOffline     = color.RGBA{128, 132, 143, 255}
+	colBad         = color.RGBA{242, 110, 110, 255}
+	colOwner       = color.RGBA{126, 227, 134, 255}
+	colAdmin       = color.RGBA{216, 146, 235, 255}
+	colStatus      = color.RGBA{246, 196, 96, 255}
+	colMeta        = color.RGBA{104, 110, 124, 255} // 气泡上方发送者小字
+	colBubbleSelf  = color.RGBA{58, 47, 29, 255}
+	colBubbleOther = color.RGBA{28, 34, 47, 255}
+	colCaret       = color.RGBA{240, 244, 250, 255}
 	colTabActive   = color.RGBA{255, 255, 255, 255}
 )
 
@@ -300,165 +311,236 @@ func (g *game) handleClicks() {
 			return
 		}
 	}
-	// 点击输入栏行 → 聚焦输入。
+	// 点击输入框区域 → 聚焦输入。
 	_, inputY, _ := g.layout()
-	if float32(y) >= inputY && float32(y) < inputY+float32(g.fs.lineH) {
+	boxTop := inputY - 8
+	if float32(y) >= boxTop && float32(y) < boxTop+g.inputBoxH() {
 		g.vm.FocusInput()
 	}
 }
 
+// inputBoxH = v20 输入框总高（含内边距）。
+func (g *game) inputBoxH() float32 { return float32(g.fs.lineH) + 18 }
+
 // ---- Draw ----
 
-// Draw 按 Snapshot 绘制。布局：顶栏 1 行 + 标签页 1 行 + 分隔线 + 主体 +
-// 输入栏 + 状态行。
+// Draw 按 Snapshot 绘制。v20 布局：顶栏带（状态行+药丸标签）→ 主体 →
+// 圆角输入框 → 底部状态带。
 func (g *game) Draw(screen *ebiten.Image) {
 	w, h := float32(g.w), float32(g.h)
 	vector.DrawFilledRect(screen, 0, 0, w, h, colBG, false)
 
 	lh := float32(g.fs.lineH)
 	bodyTop, inputY, statusY := g.layout()
-	bodyRows := int((inputY - bodyTop) / lh)
+	bodyRows := int((inputY - 14 - bodyTop) / (lh + 4))
 	if bodyRows < 1 {
 		bodyRows = 1
 	}
 	g.vm.SetBodyHeight(bodyRows)
 
-	// 顶栏 + 标签页。
-	g.drawText(screen, g.fs.small, padX, 6, g.vm.TopLine(), colDim)
-	g.drawTabs(screen, bodyTop-lh-6)
+	// 顶栏带 + 底栏带。
+	drawRoundRect(screen, 6, 6, w-12, bodyTop-14, 10, colBarBG)
+	vector.DrawFilledRect(screen, 0, statusY-8, w, h-statusY+8, colBarBG, false)
+
+	// 顶栏状态行。
+	g.drawText(screen, g.fs.small, padX+8, 12, g.vm.TopLine(), colDim)
+	g.drawTabs(screen, bodyTop-lh-8)
 
 	// 主体。
 	lines := g.vm.Snapshot()
-	g.drawBody(screen, lines, bodyTop, inputY-lh*0.4, bodyRows)
+	g.drawBody(screen, lines, bodyTop, inputY-14, bodyRows)
 
-	// 输入栏 + 状态行。
+	// 输入框 + 状态行。
 	txt, caret, active := g.vm.InputLine()
 	g.drawInput(screen, txt, caret, active, inputY, w)
-	g.drawText(screen, g.fs.small, padX, statusY, g.vm.StatusLine(), styleColor(StyleStatus))
+	g.drawText(screen, g.fs.small, padX+4, statusY, g.vm.StatusLine(), styleColor(StyleStatus))
 }
 
-// layout 返回主体起始 y、输入栏 y、状态行 y。
+// layout 返回主体起始 y、输入框顶 y、状态行基线 y。
 func (g *game) layout() (bodyTop, inputY, statusY float32) {
 	lh := float32(g.fs.lineH)
-	bodyTop = 6 + float32(g.fs.small.Metrics().HAscent+g.fs.small.Metrics().HDescent+g.fs.small.Metrics().HLineGap) + lh + 8
-	statusY = float32(g.h) - lh - 4
-	inputY = statusY - lh - 2
+	sh := float32(g.fs.smallH)
+	bodyTop = 12 + sh + lh + 14
+	statusY = float32(g.h) - sh - 10
+	inputY = statusY - float32(g.fs.lineH) - 30
 	return
 }
 
 func (g *game) drawTabs(screen *ebiten.Image, y float32) {
 	lh := float32(g.fs.lineH)
 	g.tabRects = g.tabRects[:0]
-	x := padX
+	x := padX + 6
 	active := g.vm.ActiveTab()
-	labels := TabLabels()
-	for i, name := range labels {
+	for i, name := range TabLabels() {
 		tw := float32(text.Advance(name, g.fs.body))
-		c := colDim
+		pillW := tw + 24
+		pillH := lh + 8
+		py := y - 4
 		if i == active {
-			c = colTabActive
-			vector.DrawFilledRect(screen, x-4, y-2, tw+8, lh+2, colSelBG, true)
+			drawRoundRect(screen, x, py, pillW, pillH, pillH/2, colSelBG)
+			drawRoundRect(screen, x+3, py+pillH-4, pillW-6, 2.5, 1.2, colAccent)
+			g.drawTextB(screen, g.fs.body, x+12, y, name, colTabActive)
+		} else {
+			g.drawText(screen, g.fs.body, x+12, y, name, colDim)
 		}
-		g.drawText(screen, g.fs.body, x, y, name, c)
-		g.tabRects = append(g.tabRects, rect{x: x - 4, y: y - 2, w: tw + 12, h: lh + 4})
-		x += tw + 16
+		g.tabRects = append(g.tabRects, rect{x: x, y: py, w: pillW, h: pillH})
+		x += pillW + 8
 	}
-	lw := float32(g.w) - 2*padX
-	vector.DrawFilledRect(screen, padX, y+lh+3, lw, 1, colDivider, false)
 }
 
-// drawBody 绘制面板主体。chat 面板：气泡 + 底部锚定滚动 + CJK 换行；
-// 其余面板：逐行左对齐。
+// drawBody 绘制面板主体。chat 面板：Meta 小字行 + 圆角气泡 + 底部锚定滚动；
+// 其余面板：斑马纹逐行 + 选中行圆角底与 accent 竖条。
 func (g *game) drawBody(screen *ebiten.Image, lines []ViewLine, top, bottom float32, rows int) {
 	lh := float32(g.fs.lineH)
 	w := float32(g.w)
 	if g.vm.ActiveTab() == 0 { // chat
-		vis := lines
-		off := g.vm.ChatScroll()
-		end := len(vis) - off
-		if end > len(vis) {
-			end = len(vis)
-		}
-		start := end - rows
-		if start < 0 {
-			start = 0
-		}
-		y := top
-		for _, l := range vis[start:end] {
-			frags := wrapText(l.Text, g.fs.body, float64(w-2*padX-56))
-			bubble := colBubbleOther
-			if l.Style == StyleSelf {
-				bubble = colBubbleSelf
-			}
-			if l.Style == StyleChat || l.Style == StyleSelf {
-				bw := float32(text.Advance(frags[len(frags)-1], g.fs.body))
-				bx := padX
-				if l.Style == StyleSelf {
-					bx = w - padX - bw - 8
-				}
-				for _, f := range frags {
-					if y+lh > bottom {
-						return
-					}
-					fw := float32(text.Advance(f, g.fs.body))
-					rx := bx - 6
-					if l.Style == StyleSelf {
-						rx = w - padX - fw - 14
-					}
-					vector.DrawFilledRect(screen, rx, y+1, fw+12, lh-1, bubble, false)
-					g.drawText(screen, g.fs.body, bx, y, f, styleColor(l.Style))
-					y += lh
-				}
-			} else {
-				for _, f := range frags {
-					if y+lh > bottom {
-						return
-					}
-					g.drawText(screen, g.fs.body, padX, y, f, styleColor(l.Style))
-					y += lh
-				}
-			}
-		}
+		g.drawChat(screen, lines, top, bottom, w, rows)
 		return
 	}
 	y := top
-	for _, l := range lines {
+	pitch := lh + 4
+	for zi, l := range lines {
 		if y+lh > bottom {
 			return
 		}
 		if l.Selected {
-			vector.DrawFilledRect(screen, padX-6, y-1, w-2*(padX-6), lh, colSelBG, true)
+			drawRoundRect(screen, padX, y-2, w-2*padX, pitch-1, 5, colSelBG)
+			drawRoundRect(screen, padX+3, y+2, 3, lh-5, 1.5, colAccent)
+		} else if zi%2 == 1 {
+			vector.DrawFilledRect(screen, padX, y-2, w-2*padX, pitch-1, colRowBG, false)
 		}
-		frags := wrapText(l.Text, g.fs.body, float64(w-2*padX))
-		for _, f := range frags {
+		c := styleColor(l.Style)
+		tx := padX + 14
+		frags := wrapText(l.Text, g.fs.body, float64(w-2*padX-24))
+		for fi, f := range frags {
 			if y+lh > bottom {
 				return
 			}
-			mark := "   "
-			if l.Selected {
-				mark = " > "
+			if l.Style == StyleHeader && fi == 0 {
+				g.drawTextB(screen, g.fs.body, tx, y, f, c)
+			} else {
+				g.drawText(screen, g.fs.body, tx, y, f, c)
 			}
-			g.drawText(screen, g.fs.body, padX, y, mark+f, styleColor(l.Style))
-			y += lh
+			y += pitch
 		}
 	}
 }
 
+// drawChat 绘制聊天气泡流（滚动窗口切片逻辑与 v19 一致：rows=可视条数，
+// 高气泡超出的部分停画不越界）。
+func (g *game) drawChat(screen *ebiten.Image, lines []ViewLine, top, bottom, w float32, rows int) {
+	vis := lines
+	off := g.vm.ChatScroll()
+	end := len(vis) - off
+	if end > len(vis) {
+		end = len(vis)
+	}
+	start := end - rows
+	if start < 0 {
+		start = 0
+	}
+	maxTextW := w - 2*padX - 84 // 两侧留白 + 气泡内边距
+	y := top
+	for _, l := range vis[start:end] {
+		if y > bottom {
+			return
+		}
+		switch l.Style {
+		case StyleChat, StyleSelf:
+			y = g.drawBubble(screen, l, y, bottom, w, maxTextW)
+		default:
+			frags := wrapText(l.Text, g.fs.small, float64(w-2*padX-20))
+			for _, f := range frags {
+				if y+float32(g.fs.smallH) > bottom {
+					return
+				}
+				g.drawText(screen, g.fs.small, padX+4, y, f, styleColor(l.Style))
+				y += float32(g.fs.smallH) + 2
+			}
+			y += 2
+		}
+	}
+}
+
+// drawBubble 画一条聊天消息（Meta 小字头 + 圆角气泡正文），返回下一行 y。
+func (g *game) drawBubble(screen *ebiten.Image, l ViewLine, y, bottom, w, maxTextW float32) float32 {
+	lh := float32(g.fs.lineH)
+	body := l.Body
+	if body == "" {
+		body = l.Text
+	}
+	self := l.Style == StyleSelf
+	if l.Meta != "" {
+		if y+float32(g.fs.smallH) > bottom {
+			return y
+		}
+		mw := float32(text.Advance(l.Meta, g.fs.small))
+		mx := padX + 14
+		if self {
+			mx = w - padX - 14 - mw
+		}
+		g.drawText(screen, g.fs.small, mx, y, l.Meta, colMeta)
+		y += float32(g.fs.smallH) + 2
+	}
+	frags := wrapText(body, g.fs.body, float64(maxTextW))
+	tw := float32(0)
+	for _, f := range frags {
+		if a := float32(text.Advance(f, g.fs.body)); a > tw {
+			tw = a
+		}
+	}
+	boxW := tw + 24
+	boxH := float32(len(frags))*lh + 12
+	bx := padX + 6
+	if self {
+		bx = w - padX - 6 - boxW
+	}
+	if y+boxH > bottom+lh {
+		return y
+	}
+	drawRoundRect(screen, bx, y, boxW, boxH, 8, pick(self, colBubbleSelf, colBubbleOther))
+	tc := colChat
+	if self {
+		tc = colSelf
+	}
+	for _, f := range frags {
+		g.drawText(screen, g.fs.body, bx+12, y+6, f, tc)
+		y += lh
+	}
+	return y + 10
+}
+
+func pick(cond bool, a, b color.RGBA) color.RGBA {
+	if cond {
+		return a
+	}
+	return b
+}
+
 func (g *game) drawInput(screen *ebiten.Image, txt string, caret int, active bool, y, w float32) {
 	lh := float32(g.fs.lineH)
-	inputRowY := y + 2
-	vector.DrawFilledRect(screen, 0, inputRowY-2, w, lh+4, color.RGBA{22, 25, 31, 255}, false)
-	vector.DrawFilledRect(screen, 0, inputRowY-2, w, 1, colDivider, false)
-	frags := wrapText(txt, g.fs.body, float64(w-2*padX))
+	boxW := w - 2*(padX-6)
+	drawRoundRect(screen, padX-6, y, boxW, g.inputBoxH(), 9, colDivider) // 1px 描边
+	drawRoundRect(screen, padX-5, y+1, boxW-2, g.inputBoxH()-2, 8, colCard)
+	ty := y + 9
+	tx := padX + 8
+	if txt == "> " { // 空输入：占位提示（v20）
+		g.drawText(screen, g.fs.body, tx, ty, Tr("input.placeholder"), colDim)
+		if active {
+			vector.DrawFilledRect(screen, tx+1, ty+2, 2, lh-8, colCaret, false)
+		}
+		return
+	}
+	frags := wrapText(txt, g.fs.body, float64(w-2*padX-24))
 	last := frags[len(frags)-1]
-	g.drawText(screen, g.fs.body, padX, inputRowY, last, colChat)
-	if active {
+	g.drawText(screen, g.fs.body, tx, ty, last, colChat)
+	if active && time.Now().UnixMilli()%1060 < 530 { // 光标 530ms 闪烁
 		r := []rune(last)
 		if caret >= len(r) {
 			caret = len(r)
 		}
-		cx := padX + float32(text.Advance(string(r[:caret]), g.fs.body))
-		vector.DrawFilledRect(screen, cx+1, inputRowY+2, 2, lh-6, colCaret, false)
+		cx := tx + float32(text.Advance(string(r[:caret]), g.fs.body))
+		vector.DrawFilledRect(screen, cx+1, ty+3, 2, lh-10, colCaret, false)
 	}
 }
 
@@ -470,6 +552,28 @@ func (g *game) drawText(screen *ebiten.Image, face text.Face, x, y float32, s st
 	op.GeoM.Translate(float64(x), float64(y))
 	op.ColorScale.ScaleWithColor(c)
 	text.Draw(screen, s, face, op)
+}
+
+// drawTextB 伪加粗：同串以 +0.6px 偏移重绘一次（标题/激活标签用）。
+func (g *game) drawTextB(screen *ebiten.Image, face text.Face, x, y float32, s string, c color.Color) {
+	g.drawText(screen, face, x, y, s, c)
+	g.drawText(screen, face, x+0.6, y, s, c)
+}
+
+// drawRoundRect 圆角矩形：两条正交内接矩形 + 四角圆盘（aa 平滑）。
+func drawRoundRect(dst *ebiten.Image, x, y, w, h, r float32, c color.RGBA) {
+	if r*2 > h {
+		r = h / 2
+	}
+	if r*2 > w {
+		r = w / 2
+	}
+	vector.DrawFilledRect(dst, x, y+r, w, h-2*r, c, true)
+	vector.DrawFilledRect(dst, x+r, y, w-2*r, h, c, true)
+	vector.DrawFilledCircle(dst, x+r, y+r, r, c, true)
+	vector.DrawFilledCircle(dst, x+w-r, y+r, r, c, true)
+	vector.DrawFilledCircle(dst, x+r, y+h-r, r, c, true)
+	vector.DrawFilledCircle(dst, x+w-r, y+h-r, r, c, true)
 }
 
 // ---- CJK 换行 ----
