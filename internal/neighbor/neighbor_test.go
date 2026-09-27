@@ -302,7 +302,24 @@ func TestFloodAndSendTo(t *testing.T) {
 	}
 }
 
-// remove → 断 sender；kick（多种 Content 编码）→ 断目标；unban/未知类型 → 不动。
+// remove → 断 sender；kick（多种 body 载荷编码）→ 断目标；unban/text → 不动。
+
+// evMsg 造一条 v26 事件消息：kind 由名字查注册表，payload 装进 body 的标签位；
+// payload 本身不是合法 JSON 时按字符串装（宽松解析用例正是走这条路）。
+func evMsg(name string, sender core.PubKey, payload string, to *core.PubKey) core.Message {
+	kind, ok := core.KindOf(name)
+	if !ok {
+		panic("unknown body name " + name)
+	}
+	b, err := core.MakeBody(name, json.RawMessage(payload))
+	if err != nil {
+		if b, err = core.MakeBody(name, payload); err != nil {
+			panic(err)
+		}
+	}
+	return core.Message{Kind: kind, Sender: sender, Body: b, To: to}
+}
+
 func TestEventDisconnect(t *testing.T) {
 	targetB := core.PubKey{Alg: core.SigEd25519, Bytes: []byte("BB")}
 	cases := []struct {
@@ -312,21 +329,23 @@ func TestEventDisconnect(t *testing.T) {
 		wantTargetClosed bool
 	}{
 		{"remove disconnects sender",
-			core.Message{Type: core.TypeRemove, Sender: pubA()}, true, false},
+			evMsg(core.NameRemove, pubA(), "null", nil), true, false},
 		{"kick pub-field json",
-			core.Message{Type: core.TypeKick, Sender: pubA(), Content: mustPubJSON(targetB)}, false, true},
+			evMsg(core.NameKick, pubA(), string(mustPubJSON(targetB)), nil), false, true},
 		{"kick target field json",
-			core.Message{Type: core.TypeKick, Sender: pubA(), Content: mustTargetJSON(targetB)}, false, true},
-		{"kick plain alg:hex content",
-			core.Message{Type: core.TypeKick, Sender: pubA(), Content: []byte(`"` + targetB.String() + `"`)}, false, true},
+			evMsg(core.NameKick, pubA(), string(mustTargetJSON(targetB)), nil), false, true},
+		{"kick plain alg:hex payload",
+			evMsg(core.NameKick, pubA(), `"`+targetB.String()+`"`, nil), false, true},
 		{"kick via To fallback",
-			core.Message{Type: core.TypeKick, Sender: pubA(), To: &targetB, Content: []byte("null")}, false, true},
+			evMsg(core.NameKick, pubA(), "null", &targetB), false, true},
 		{"unban no-op",
-			core.Message{Type: core.TypeUnban, Sender: pubA()}, false, false},
+			evMsg(core.NameUnban, pubA(), "null", nil), false, false},
 		{"text no-op",
-			core.Message{Type: core.TypeText, Sender: pubA()}, false, false},
+			evMsg(core.NameText, pubA(), `"hi"`, nil), false, false},
 		{"kick unparseable keeps everyone",
-			core.Message{Type: core.TypeKick, Sender: pubA(), Content: []byte("garbage")}, false, false},
+			evMsg(core.NameKick, pubA(), "garbage", nil), false, false},
+		{"kind 谎报（cmd 标成 msg）不断任何人",
+			kindLie(evMsg(core.NameKick, pubA(), string(mustPubJSON(targetB)), nil)), false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -351,6 +370,13 @@ func TestEventDisconnect(t *testing.T) {
 }
 
 func pubA() core.PubKey { return core.PubKey{Alg: core.SigEd25519, Bytes: []byte{65, 65}} }
+
+// kindLie 把大类改成 msg（body 仍写着 kick）：HandleRosterEvent 只认 body 标签，
+// 消息层的 kind 互校由 engine/roster 负责，这里钉住「按 body 判别」这一条。
+func kindLie(m core.Message) core.Message {
+	m.Kind = core.KindMessage
+	return m
+}
 
 func mustPubJSON(p core.PubKey) []byte {
 	b, _ := json.Marshal(map[string]any{"pub": p})

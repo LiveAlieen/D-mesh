@@ -1,10 +1,8 @@
 package netdisk
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -638,16 +636,9 @@ func (m *Manager) RemoveFile(mf *Manifest) error {
 	return errors.Join(errs...)
 }
 
-// ---------- 清单的 TypeHide 消息封装（「全员按 msg 事件确认后可见」） ----------
+// ---------- 清单的 ext/manifest 消息封装（「全员按消息确认后可见」） ----------
 
-const manifestKind = "netdisk_manifest"
-
-type manifestEnvelope struct {
-	Kind     string    `json:"kind"`
-	Manifest *Manifest `json:"manifest"`
-}
-
-// msgIDFor 确定性派生 msg_id（sender+content+ts 的哈希前 32 hex）：
+// msgIDFor 确定性派生 msg_id（sender+body+ts 的哈希前 32 hex）：
 // 同一清单/事件在任何节点重算都得到同一 id，天然支持消息层按 msg_id 去重。
 func msgIDFor(sender core.PubKey, content []byte, ts int64) string {
 	h := sha256.New()
@@ -661,24 +652,24 @@ func msgIDFor(sender core.PubKey, content []byte, ts int64) string {
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
-// ManifestMessage 把清单打包成 TypeHide 消息并由本机签名（MsgID 确定性派生，
+// ManifestMessage 把清单打包成 ext/manifest 消息并由本机签名（MsgID 确定性派生，
 // 天然支持消息层按 msg_id 去重）。集成层负责 flood/存储后全网可见。
 func (m *Manager) ManifestMessage(mf *Manifest) (core.Message, error) {
 	if mf == nil {
 		return core.Message{}, ErrNilDependency
 	}
-	content, err := core.CanonicalJSON(manifestEnvelope{Kind: manifestKind, Manifest: mf})
+	body, err := core.MakeBody(core.NameManifest, mf)
 	if err != nil {
 		return core.Message{}, err
 	}
 	ts := m.now()
 	msg := core.Message{
-		MsgID:   msgIDFor(m.self, content, ts),
+		MsgID:   msgIDFor(m.self, body, ts),
 		GroupID: m.groupID,
 		Sender:  m.self,
 		TSms:    ts,
-		Type:    core.TypeHide,
-		Content: content,
+		Kind:    core.KindExtension,
+		Body:    body,
 		Alg:     m.signer.Alg(),
 	}
 	raw, err := core.MessageSigPayload(msg)
@@ -697,7 +688,7 @@ func (m *Manager) ManifestMessage(mf *Manifest) (core.Message, error) {
 // 转发者——签名在 Sender 上）+ 逐字段复验清单（CheckManifest 含 proof 复验）。
 // 签名者是否群成员由集成层结合 roster 判定（与消息层同一准入）。
 func ManifestFromMessage(msg core.Message, groupID [32]byte) (*Manifest, core.PubKey, error) {
-	if msg.Type != core.TypeHide || msg.GroupID != groupID {
+	if name, err := core.CheckBody(msg.Kind, msg.Body); err != nil || name != core.NameManifest {
 		return nil, core.PubKey{}, fmt.Errorf("%w: not a netdisk manifest message", ErrBadManifest)
 	}
 	raw, err := core.MessageSigPayload(msg)
@@ -707,16 +698,12 @@ func ManifestFromMessage(msg core.Message, groupID [32]byte) (*Manifest, core.Pu
 	if err := core.Verify(msg.Sender, raw, msg.Sig); err != nil {
 		return nil, msg.Sender, fmt.Errorf("%w: %w", ErrBadManifest, err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(msg.Content))
-	var env manifestEnvelope
-	if err := dec.Decode(&env); err != nil {
+	var mf Manifest
+	if err := core.BodyPayload(msg.Body, core.NameManifest, &mf); err != nil {
 		return nil, msg.Sender, fmt.Errorf("%w: %v", ErrBadManifest, err)
 	}
-	if env.Kind != manifestKind || env.Manifest == nil {
-		return nil, msg.Sender, fmt.Errorf("%w: wrong envelope kind", ErrBadManifest)
-	}
-	if err := CheckManifest(env.Manifest, groupID); err != nil {
+	if err := CheckManifest(&mf, groupID); err != nil {
 		return nil, msg.Sender, err
 	}
-	return env.Manifest, msg.Sender, nil
+	return &mf, msg.Sender, nil
 }

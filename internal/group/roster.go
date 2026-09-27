@@ -2,9 +2,9 @@
 // 白名单（成员/权限/角色）+ 黑名单（准入）+ 在场表 + owner 指针，
 // 全部由 core.Message 承载的签名名单事件驱动、各端独立验签收敛。
 //
-// 类型 Roster 实现 core.Roster 接口。事件内容（Content 字段）统一为
-// CanonicalJSON 编码的小 JSON 对象（结构见本文件），本包同时导出
-// EncodeEventContent 与 SignEvent/EndorseEvent（signer.go），供 message/cmd
+// 类型 Roster 实现 core.Roster 接口。v26 起事件正文统一为 tagged-union Body
+// （`{"<事件名>": 载荷}`，CanonicalJSON，结构见本文件），本包同时导出
+// EncodeEventBody 与 SignEvent/EndorseEvent（signer.go），供 message/cmd
 // 构造事件，保证跨包使用同一验签原文。
 //
 // 信任规则（逐条对应 PLAN）：
@@ -76,20 +76,16 @@ type eventNetdisk struct {
 	MB int `json:"mb"`
 }
 
-// EncodeEventContent 用 CanonicalJSON 编码名单事件内容，供构造
-// core.Message.Content（全工程统一走这里，保证各端验签原文一致）。
-func EncodeEventContent(v any) ([]byte, error) { return core.CanonicalJSON(v) }
+// EncodeEventBody 把一个名单事件的载荷包成 v26 的 tagged-union 正文
+// （`{"<事件名>": 载荷}`，CanonicalJSON）。全工程签发端统一走这里：事件名由
+// 调用方显式给出，与解码端 decodeEventBody 共用同一个 core.Name* 常量，
+// 从根上堵住「生产端与解码端各写一份结构」的跨包字节漂移（v25 网盘配额事故）。
+func EncodeEventBody(name string, payload any) ([]byte, error) { return core.MakeBody(name, payload) }
 
-// decodeEventContent 严格解码事件内容：未知字段与尾部数据拒绝
-// （字段名被改写/夹带即判结构篡改）。
-func decodeEventContent(b []byte, v any) error {
-	if len(b) == 0 {
-		return fmt.Errorf("%w: empty event content", core.ErrMalformed)
-	}
-	if err := strictUnmarshal(b, v); err != nil {
-		return fmt.Errorf("%w: event content: %v", core.ErrMalformed, err)
-	}
-	return nil
+// decodeEventBody 按事件名严格解出正文载荷：键名不符、未知字段、尾部多余数据
+// 一律拒绝（字段名被改写/夹带即判结构篡改）。
+func decodeEventBody(m core.Message, name string, v any) error {
+	return core.BodyPayload(m.Body, name, v)
 }
 
 // ---------------------------------------------------------------------------

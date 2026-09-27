@@ -376,7 +376,7 @@ func TestVMSelfMessageHideableAfterAck(t *testing.T) {
 	// 他人消息：只有复制。
 	other := keyPub(t, 0xbb)
 	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "m-other", Sender: other, TSms: 1700000000000,
-		Type: core.TypeText, Content: []byte("from other")}})
+		Kind: core.KindMessage, Body: []byte(`{"text":"from other"}`)}})
 	vis := 0
 	for _, l := range v.chat {
 		if l.hidden {
@@ -409,7 +409,7 @@ func TestVMSpeakDenied(t *testing.T) {
 
 func TestVMHideMarksLine(t *testing.T) {
 	v, app := newTestVM(t)
-	msg := core.Message{MsgID: "m1", Sender: app.self, TSms: 1700000000000, Type: core.TypeText, Content: []byte("secret")}
+	msg := core.Message{MsgID: "m1", Sender: app.self, TSms: 1700000000000, Kind: core.KindMessage, Body: []byte(`{"text":"secret"}`)}
 	v.OnEvent(TextEvent{Msg: msg})
 	pickRowAction(t, v, rowOf(t, v, "secret"), ActHide) // 自己的气泡右键=隐藏（先确认）
 	if mustDialog(t, v).kind != dlgConfirm {
@@ -439,7 +439,7 @@ func TestVMSlashIsPlainTextInGUI(t *testing.T) {
 // v25：右键菜单在场时 Esc 只收菜单，不动面板与输入。
 func TestVMMenuOverlayEsc(t *testing.T) {
 	v, app := newTestVM(t)
-	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "c1", Sender: app.self, TSms: 1700000000000, Type: core.TypeText, Content: []byte("hi")}})
+	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "c1", Sender: app.self, TSms: 1700000000000, Kind: core.KindMessage, Body: []byte(`{"text":"hi"}`)}})
 	row := rowOf(t, v, "hi")
 	v.ClickRow(row, true)
 	if v.Menu() == nil {
@@ -463,7 +463,7 @@ func TestVMMenuOverlayEsc(t *testing.T) {
 
 func TestVMInboundEvents(t *testing.T) {
 	v, _ := newTestVM(t)
-	msg := core.Message{MsgID: "i1", Sender: keyPub(t, 0xbb), TSms: 1700000000000, Type: core.TypeText, Content: []byte("yo")}
+	msg := core.Message{MsgID: "i1", Sender: keyPub(t, 0xbb), TSms: 1700000000000, Kind: core.KindMessage, Body: []byte(`{"text":"yo"}`)}
 	v.OnEvent(TextEvent{Msg: msg})
 	if len(v.chat) != 1 || !strings.Contains(v.chat[0].text, "yo") {
 		t.Fatalf("chat = %+v", v.chat)
@@ -472,7 +472,7 @@ func TestVMInboundEvents(t *testing.T) {
 	if len(v.members) != 2 {
 		t.Fatalf("roster event must refresh members: %d", len(v.members))
 	}
-	v.OnEvent(AppealEvent{Msg: core.Message{MsgID: "ap1", Sender: keyPub(t, 0xcc), Type: core.TypeText, Content: []byte("please unban")}})
+	v.OnEvent(AppealEvent{Msg: core.Message{MsgID: "ap1", Sender: keyPub(t, 0xcc), Kind: core.KindMessage, Body: []byte(`{"text":"please unban"}`)}})
 	if len(v.appeals) != 1 || !strings.Contains(v.status, "appeal") {
 		t.Fatalf("appeals = %d status = %q", len(v.appeals), v.status)
 	}
@@ -760,7 +760,7 @@ func TestVMActionBarsExposeEverything(t *testing.T) {
 func TestVMAppealUnbanAndIgnore(t *testing.T) {
 	v, app := newTestVM(t)
 	sender := keyPub(t, 0xcc)
-	v.OnEvent(AppealEvent{Msg: core.Message{MsgID: "ap", Sender: sender, Content: []byte("help")}})
+	v.OnEvent(AppealEvent{Msg: core.Message{MsgID: "ap", Sender: sender, Kind: core.KindMessage, Body: []byte(`{"text":"help"}`)}})
 	v.SwitchTab(3) // admin
 	// members(2)+banned(0)+transfers(0)+appeal at sel=2
 	v.OnKey(KeyDown)
@@ -1124,7 +1124,7 @@ func TestVMAsyncDeliverMarshalling(t *testing.T) {
 func TestVMSnapshotSmoke(t *testing.T) {
 	v, app := newTestVM(t)
 	v.SetBodyHeight(20)
-	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "x", Sender: keyPub(t, 0xbb), TSms: 1700000000000, Type: core.TypeText, Content: []byte("hello")}})
+	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "x", Sender: keyPub(t, 0xbb), TSms: 1700000000000, Kind: core.KindMessage, Body: []byte(`{"text":"hello"}`)}})
 	s := snapText(v)
 	for _, want := range []string{"chat", "hello"} { // StatusLine/快照均可见
 		if !strings.Contains(s+"\n"+v.StatusLine(), want) {

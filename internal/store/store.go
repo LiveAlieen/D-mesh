@@ -17,7 +17,7 @@
 //     索引与 hide 标记），由 group 包在启动时从本包读出后继续增量应用。
 //  4. 所有写接口对并发调用安全（内部串行化；SQLite 连接池限制为 1）。
 //
-// hide 原文约定：type=hide 的消息 Content 按两种形式解析目标 msg_id——
+// hide 原文约定：name=hide 的消息 body 载荷按两种形式解析目标 msg_id——
 // JSON 对象（键 target_msg_id / msg_id / target 任一）或裸字符串；
 // 两种历史格式都能被重建流程识别。
 package store
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	msg_id   TEXT PRIMARY KEY,
 	sender   TEXT NOT NULL,
 	ts_ms    INTEGER NOT NULL,
-	type     TEXT NOT NULL,
+	name     TEXT NOT NULL,            -- 具体消息名（body 单键：text/hide/join/…）
 	data     BLOB NOT NULL            -- CanonicalJSON(core.Message)，与 JSONL 行同字节
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts_ms);

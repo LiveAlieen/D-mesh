@@ -38,6 +38,16 @@ func verifyMessageSig(sender core.PubKey, alg core.SigAlg, payload, sig []byte) 
 	return core.Verify(sender, payload, sig)
 }
 
+// proofEventName 从一条 proof 原文里取出事件名，并做 v26 的 kind↔body 键互校
+// （proof.Raw 就是签名原文，即整个信封的 CanonicalJSON，含 kind 与 body）。
+func proofEventName(m core.Message) (string, error) {
+	name, err := core.CheckBody(m.Kind, m.Body)
+	if err != nil {
+		return "", fmt.Errorf("%w: proof raw body: %v", core.ErrMalformed, err)
+	}
+	return name, nil
+}
+
 // verifyMemberProof 复验白名单条目的 proof：
 //  1. Raw 必须是结构合法的 join 事件原文（成员条目 proof 一律来自 join）；
 //  2. Raw 里 sender（拉人者）+ proof.Alg 一致性粗检后按签名分派验签；
@@ -50,7 +60,9 @@ func verifyMemberProof(e core.MemberEntry) error {
 	if err := strictUnmarshal(e.Proof.Raw, &m); err != nil {
 		return fmt.Errorf("%w: member proof raw not a message: %v", core.ErrMalformed, err)
 	}
-	if m.Type != core.TypeJoin {
+	if name, err := proofEventName(m); err != nil {
+		return err
+	} else if name != core.NameJoin {
 		return fmt.Errorf("%w: member proof must be a join event", core.ErrMalformed)
 	}
 	if m.Alg != e.Proof.Alg {
@@ -60,8 +72,8 @@ func verifyMemberProof(e core.MemberEntry) error {
 		return err
 	}
 	var c eventJoin
-	if err := strictUnmarshal(m.Content, &c); err != nil {
-		return fmt.Errorf("%w: member proof content: %v", core.ErrMalformed, err)
+	if err := core.BodyPayload(m.Body, core.NameJoin, &c); err != nil {
+		return fmt.Errorf("%w: member proof body: %v", core.ErrMalformed, err)
 	}
 	if !c.Pub.Equal(e.Pub) || c.WG != e.WG {
 		return fmt.Errorf("%w: member entry pub/wg does not match its proof", core.ErrMalformed)
@@ -75,7 +87,9 @@ func verifyBlacklistProof(e core.BlacklistEntry) error {
 	if err := strictUnmarshal(e.Proof.Raw, &m); err != nil {
 		return fmt.Errorf("%w: blacklist proof raw not a message: %v", core.ErrMalformed, err)
 	}
-	if m.Type != core.TypeKick {
+	if name, err := proofEventName(m); err != nil {
+		return err
+	} else if name != core.NameKick {
 		return fmt.Errorf("%w: blacklist proof must be a kick event", core.ErrMalformed)
 	}
 	if m.Alg != e.Proof.Alg {
@@ -84,9 +98,11 @@ func verifyBlacklistProof(e core.BlacklistEntry) error {
 	if err := core.Verify(m.Sender, e.Proof.Raw, e.Proof.Sig); err != nil {
 		return err
 	}
+	// kick 与 remove/unban/grant/revoke 共用 {"target": …} 载荷形状——正因如此
+	// 事件名必须显式存在于 body 的键上，此处才谈得上「必须是 kick」。
 	var c eventTarget
-	if err := strictUnmarshal(m.Content, &c); err != nil {
-		return fmt.Errorf("%w: blacklist proof content: %v", core.ErrMalformed, err)
+	if err := core.BodyPayload(m.Body, core.NameKick, &c); err != nil {
+		return fmt.Errorf("%w: blacklist proof body: %v", core.ErrMalformed, err)
 	}
 	if !c.Target.Equal(e.Pub) {
 		return fmt.Errorf("%w: blacklist entry pub does not match its kick proof", core.ErrMalformed)

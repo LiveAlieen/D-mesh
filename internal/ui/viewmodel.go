@@ -235,12 +235,14 @@ func chatMeta(m core.Message) string {
 	return ts + " · " + ShortID(m.Sender) + dir
 }
 
+// chatBody 渲染一条消息的正文文本：聊天正文直接取 text 载荷，命令/扩展显示
+// 「(名字) body 原文」，协议 token 不进语言文件（v20 铁律）。
 func chatBody(m core.Message) string {
-	body := strings.ToValidUTF8(string(m.Content), "\uFFFD")
-	if m.Type != core.TypeText {
-		body = "(" + m.Type + ") " + body
+	if s, ok := core.TextOf(m); ok {
+		return strings.ToValidUTF8(s, "\uFFFD")
 	}
-	return body
+	name, _ := core.BodyName(m.Body)
+	return "(" + name + ") " + strings.ToValidUTF8(string(m.Body), "\uFFFD")
 }
 
 func (v *viewModel) upsertJoinReq(req JoinRequest) {
@@ -719,7 +721,11 @@ func (v *viewModel) outboundDraft(text string) core.Message {
 	if sig != nil {
 		self = sig.Pub()
 	}
-	return core.Message{Sender: self, TSms: v.currentTime().UnixMilli(), Type: core.TypeText, Content: []byte(text)}
+	body, err := core.TextBody(text)
+	if err != nil {
+		body = []byte(`{"text":""}`)
+	}
+	return core.Message{Sender: self, TSms: v.currentTime().UnixMilli(), Kind: core.KindMessage, Body: body}
 }
 
 // ---- 面板行数与行语义 ----

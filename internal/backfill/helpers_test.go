@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -60,24 +59,24 @@ var testGroupID = sha256.Sum256([]byte("dmesh-backfill-test-group"))
 // makeMsg 构造一条已签名消息：MsgID = sha256(nonce) 的前 16 个 hex 字符，
 // 即「同 nonce 同 msg_id、不同 nonce 不同 msg_id」（同 nonce 不同内容 => 同
 // msg_id 的冲突版本，用于伪造交叉差异场景）。
-func makeMsg(t *testing.T, s *signer, typ string, content any, ts int64, nonce string) core.Message {
+func makeMsg(t *testing.T, s *signer, name string, payload any, ts int64, nonce string) core.Message {
 	t.Helper()
-	return makeMsgTo(t, s, typ, content, ts, nonce, nil)
+	return makeMsgTo(t, s, name, payload, ts, nonce, nil)
 }
 
 // makeMsgTo 构造一条已签名消息，to 非 nil 时写入定向字段 To。
 //
 // To 必须在签名之前写入：MessageSigPayload 的原文含 to（PLAN 的定向申诉消息
 // 必须被签名绑定），签后再改 To 就等于伪造了一条坏签名。
-func makeMsgTo(t *testing.T, s *signer, typ string, content any, ts int64, nonce string, to *core.PubKey) core.Message {
+func makeMsgTo(t *testing.T, s *signer, name string, payload any, ts int64, nonce string, to *core.PubKey) core.Message {
 	t.Helper()
-	var cb []byte
-	if content != nil {
-		var err error
-		cb, err = json.Marshal(content)
-		if err != nil {
-			t.Fatal(err)
-		}
+	kind, ok := core.KindOf(name)
+	if !ok {
+		t.Fatalf("unknown body name %q", name)
+	}
+	cb, err := core.MakeBody(name, payload)
+	if err != nil {
+		t.Fatal(err)
 	}
 	id := sha256.Sum256([]byte(nonce))
 	m := core.Message{
@@ -85,22 +84,22 @@ func makeMsgTo(t *testing.T, s *signer, typ string, content any, ts int64, nonce
 		GroupID: testGroupID,
 		Sender:  s.pub(),
 		TSms:    ts,
-		Type:    typ,
-		Content: cb,
+		Kind:    kind,
+		Body:    cb,
 		To:      to,
 		Alg:     core.SigEd25519,
 	}
-	payload, err := core.MessageSigPayload(m)
+	sigPayload, err := core.MessageSigPayload(m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Sig = s.sign(payload)
+	m.Sig = s.sign(sigPayload)
 	return m
 }
 
 func makeText(t *testing.T, s *signer, body string, ts int64, nonce string) core.Message {
 	t.Helper()
-	return makeMsg(t, s, core.TypeText, body, ts, nonce)
+	return makeMsg(t, s, core.NameText, body, ts, nonce)
 }
 
 type joinContent struct {
@@ -115,12 +114,12 @@ type targetContent struct {
 
 func makeJoin(t *testing.T, carrier *signer, target *signer, perms []string, ts int64) core.Message {
 	t.Helper()
-	return makeMsg(t, carrier, core.TypeJoin, joinContent{Pub: target.pub(), WG: target.wg(), Perms: perms}, ts, "join/"+target.pub().String()+fmt.Sprint(ts))
+	return makeMsg(t, carrier, core.NameJoin, joinContent{Pub: target.pub(), WG: target.wg(), Perms: perms}, ts, "join/"+target.pub().String()+fmt.Sprint(ts))
 }
 
 func makeKick(t *testing.T, kicker *signer, target core.PubKey, ts int64) core.Message {
 	t.Helper()
-	return makeMsg(t, kicker, core.TypeKick, targetContent{Pub: target}, ts, "kick/"+target.String()+fmt.Sprint(ts))
+	return makeMsg(t, kicker, core.NameKick, targetContent{Pub: target}, ts, "kick/"+target.String()+fmt.Sprint(ts))
 }
 
 func proofOf(t *testing.T, m core.Message) core.Proof {
@@ -243,10 +242,10 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 	if err := core.Verify(m.Sender, payload, m.Sig); err != nil {
 		return err
 	}
-	switch m.Type {
-	case core.TypeJoin:
+	switch nm, _ := core.BodyName(m.Body); nm {
+	case core.NameJoin:
 		var jc joinContent
-		if err := json.Unmarshal(m.Content, &jc); err != nil {
+		if err := core.BodyPayload(m.Body, core.NameJoin, &jc); err != nil {
 			return fmt.Errorf("%w: join content", core.ErrMalformed)
 		}
 		if m.Sender.Equal(jc.Pub) {
@@ -270,9 +269,9 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 			Proof: proofOfNoErr(m), TS: m.TSms,
 		}
 		return nil
-	case core.TypeKick:
+	case core.NameKick:
 		var tc targetContent
-		if err := json.Unmarshal(m.Content, &tc); err != nil {
+		if err := core.BodyPayload(m.Body, core.NameKick, &tc); err != nil {
 			return fmt.Errorf("%w: kick content", core.ErrMalformed)
 		}
 		if !r.HasPerm(m.Sender, core.PermKick) {
@@ -283,9 +282,9 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 		delete(r.members, tc.Pub.Key())
 		r.bans[tc.Pub.Key()] = core.BlacklistEntry{Pub: tc.Pub, Proof: proofOfNoErr(m), TS: m.TSms}
 		return nil
-	case core.TypeUnban:
+	case core.NameUnban:
 		var tc targetContent
-		if err := json.Unmarshal(m.Content, &tc); err != nil {
+		if err := core.BodyPayload(m.Body, core.NameUnban, &tc); err != nil {
 			return fmt.Errorf("%w: unban content", core.ErrMalformed)
 		}
 		if !r.HasPerm(m.Sender, core.PermUnban) && !r.HasPerm(m.Sender, core.PermKick) {
@@ -295,9 +294,9 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 		defer r.mu.Unlock()
 		delete(r.bans, tc.Pub.Key())
 		return nil
-	case core.TypeRemove:
+	case core.NameRemove:
 		var tc targetContent
-		if err := json.Unmarshal(m.Content, &tc); err != nil {
+		if err := core.BodyPayload(m.Body, core.NameRemove, &tc); err != nil {
 			return fmt.Errorf("%w: remove content", core.ErrMalformed)
 		}
 		if !m.Sender.Equal(tc.Pub) {
@@ -307,13 +306,13 @@ func (r *testRoster) ApplyEvent(m core.Message) error {
 		defer r.mu.Unlock()
 		delete(r.members, tc.Pub.Key())
 		return nil
-	case core.TypePresence:
+	case core.NamePresence:
 		var pc struct {
 			Pub          core.PubKey `json:"pub"`
 			LastMsgTS    int64       `json:"last_msg_ts"`
 			OfflineAfter int64       `json:"offline_after"`
 		}
-		if err := json.Unmarshal(m.Content, &pc); err != nil {
+		if err := core.BodyPayload(m.Body, core.NamePresence, &pc); err != nil {
 			return fmt.Errorf("%w: presence content", core.ErrMalformed)
 		}
 		if !m.Sender.Equal(pc.Pub) {

@@ -16,7 +16,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -152,8 +151,8 @@ func main() {
 	}
 	e.nt = nt
 	e.engine = message.NewEngine(gid, self, roster, msgTx{nt}, msgPeers{nt}, message.Handlers{
-		Chat:    func(m core.Message) { fmt.Printf("CHAT %s: %s\n", short(m.Sender), string(m.Content)) },
-		Appeal:  func(m core.Message) { fmt.Printf("APPEAL %s: %s\n", short(m.Sender), string(m.Content)) },
+		Chat:    func(m core.Message) { fmt.Printf("CHAT %s: %s\n", short(m.Sender), bodyForLog(m)) },
+		Appeal:  func(m core.Message) { fmt.Printf("APPEAL %s: %s\n", short(m.Sender), bodyForLog(m)) },
 		JoinReq: e.handleJoinReq,
 	})
 
@@ -280,13 +279,25 @@ func (e *echoer) onJoin(pub core.PubKey) {
 	e.logger.Printf("neighbor joined %s (peers=%d)", pub, e.nt.Count())
 }
 
+// bodyForLog 打印用：聊天取 text 正文，命令/扩展显示 body 原文。
+func bodyForLog(m core.Message) string {
+	if s, ok := core.TextOf(m); ok {
+		return s
+	}
+	return string(m.Body)
+}
+
 // sendText：文本消息 + 配套 presence（PLAN v13：消息自带发送时间戳推进在场表）。
 func (e *echoer) sendText(text string) error {
 	if e.roster.TierOf(e.id.Pub()) < 0 {
 		return errors.New("还不是成员（等 join 生效或去掉 --join 检查拉人端）")
 	}
 	ts := time.Now().UnixMilli()
-	m := core.Message{Type: core.TypeText, Content: []byte(text), TSms: ts}
+	body, err := core.TextBody(text)
+	if err != nil {
+		return err
+	}
+	m := core.Message{Kind: core.KindMessage, Body: body, TSms: ts}
 	signed, err := message.NewMessage(e.id, e.gid, &m, nil)
 	if err != nil {
 		return err
@@ -302,7 +313,7 @@ func (e *echoer) publishPresence(lastTS int64) error {
 	if lastTS > ts {
 		lastTS = ts
 	}
-	return e.signAndPublish(core.TypePresence, echoPresence{Pub: e.id.Pub(), LastMsgTS: lastTS, OfflineAfter: e.offline}, ts)
+	return e.signAndPublish(core.NamePresence, echoPresence{Pub: e.id.Pub(), LastMsgTS: lastTS, OfflineAfter: e.offline}, ts)
 }
 
 func (e *echoer) presenceLoop(ctx context.Context, d time.Duration) {
@@ -318,18 +329,23 @@ func (e *echoer) presenceLoop(ctx context.Context, d time.Duration) {
 	}
 }
 
-func (e *echoer) signAndPublish(typ string, content any, tsMS int64) error {
-	cb, err := group.EncodeEventContent(content)
+func (e *echoer) signAndPublish(name string, payload any, tsMS int64) error {
+	kind, ok := core.KindOf(name)
+	if !ok {
+		return fmt.Errorf("%w: unknown event name %q", core.ErrMalformed, name)
+	}
+	cb, err := group.EncodeEventBody(name, payload)
 	if err != nil {
 		return err
 	}
-	m := core.Message{Type: typ, Content: cb, TSms: tsMS}
+	m := core.Message{Kind: kind, Body: cb, TSms: tsMS}
 	if err := group.SignEvent(&m, e.id, e.gid); err != nil {
 		return err
 	}
-	if message.IsRosterEvent(m.Type) {
+	evt, _ := core.BodyName(m.Body)
+	if message.IsRosterEvent(evt) {
 		if err := e.roster.ApplyEvent(m); err != nil {
-			return fmt.Errorf("local apply %s: %w", m.Type, err)
+			return fmt.Errorf("local apply %s: %w", evt, err)
 		}
 	}
 	_, err = e.engine.Publish(m)
@@ -353,7 +369,7 @@ func (e *echoer) ensureJoined(ctx context.Context, self core.PubKey) {
 		}
 		wg := e.id.WGPub()
 		content := echoJoinReq{Pub: self, WG: wg, Ref: e.seedRef}
-		if err := e.signAndPublish(core.TypeJoinReq, content, time.Now().UnixMilli()); err != nil {
+		if err := e.signAndPublish(core.NameJoinReq, content, time.Now().UnixMilli()); err != nil {
 			e.logger.Printf("join_req: %v", err)
 			continue
 		}
@@ -378,7 +394,7 @@ func (e *echoer) ensureJoined(ctx context.Context, self core.PubKey) {
 // auto 模式 + --auto-approve 即放行签 join。
 func (e *echoer) handleJoinReq(m core.Message) {
 	var c echoJoinReq
-	if err := json.Unmarshal(m.Content, &c); err != nil || !c.Pub.Equal(m.Sender) || c.WG.IsZero() {
+	if err := core.BodyPayload(m.Body, core.NameJoinReq, &c); err != nil || !c.Pub.Equal(m.Sender) || c.WG.IsZero() {
 		return
 	}
 	if _, ok := e.roster.Member(m.Sender); ok || e.roster.IsBlacklisted(m.Sender) {
@@ -396,7 +412,7 @@ func (e *echoer) handleJoinReq(m core.Message) {
 	if len(perms) == 0 {
 		perms = []string{core.PermSpeak, core.PermReceive}
 	}
-	if err := e.signAndPublish(core.TypeJoin, echoJoin{Pub: m.Sender, WG: c.WG, Perms: perms}, time.Now().UnixMilli()); err != nil {
+	if err := e.signAndPublish(core.NameJoin, echoJoin{Pub: m.Sender, WG: c.WG, Perms: perms}, time.Now().UnixMilli()); err != nil {
 		e.logger.Printf("sign join: %v", err)
 		return
 	}

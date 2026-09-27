@@ -183,11 +183,7 @@ func FormatChatLine(m core.Message) string {
 	if m.To != nil {
 		dir = " →" + ShortID(*m.To)
 	}
-	body := strings.ToValidUTF8(string(m.Content), "\uFFFD")
-	if m.Type != core.TypeText {
-		body = "(" + m.Type + ") " + body
-	}
-	return fmt.Sprintf("[%s] %s%s: %s", ts, sender, dir, body)
+	return fmt.Sprintf("[%s] %s%s: %s", ts, sender, dir, chatBody(m))
 }
 
 // ---- 入群面板 ----

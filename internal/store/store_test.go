@@ -24,15 +24,28 @@ func mkPub(t *testing.T, tag byte) core.PubKey {
 	return core.PubKey{Alg: core.SigEd25519, Bytes: b}
 }
 
-func mkMsg(t *testing.T, id string, sender core.PubKey, ts int64, typ, content string) core.Message {
+// mkMsg 造一条已成形消息（不验签，只测存储索引）：body 由 name + 载荷打成标签联合，
+// 载荷本身不是 JSON 时按字符串装（聊天正文即此形态）。
+func mkMsg(t *testing.T, id string, sender core.PubKey, ts int64, name, payload string) core.Message {
 	t.Helper()
+	kind, ok := core.KindOf(name)
+	if !ok {
+		t.Fatalf("unknown body name %q", name)
+	}
+	body, err := core.MakeBody(name, json.RawMessage(payload))
+	if err != nil {
+		body, err = core.MakeBody(name, payload)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	return core.Message{
 		MsgID:   id,
 		GroupID: [32]byte{byte(len(id)), 7},
 		Sender:  sender,
 		TSms:    ts,
-		Type:    typ,
-		Content: []byte(content),
+		Kind:    kind,
+		Body:    body,
 		Alg:     core.SigEd25519,
 		Sig:     []byte("sig-" + id),
 	}
@@ -73,7 +86,7 @@ func TestOpenCreatesDirAndFiles(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("double Close: %v", err)
 	}
-	if _, err := s.AppendMessage(mkMsg(t, "x", mkPub(t, 1), 1, core.TypeText, "x")); !errors.Is(err, ErrClosed) {
+	if _, err := s.AppendMessage(mkMsg(t, "x", mkPub(t, 1), 1, core.NameText, "x")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("after Close want ErrClosed, got %v", err)
 	}
 }
@@ -82,7 +95,7 @@ func TestOpenCreatesDirAndFiles(t *testing.T) {
 
 func TestAppendDedup(t *testing.T) {
 	s := mustOpen(t, openTmp(t))
-	m := mkMsg(t, "m1", mkPub(t, 1), 1000, core.TypeText, "hello")
+	m := mkMsg(t, "m1", mkPub(t, 1), 1000, core.NameText, "hello")
 
 	appended, err := s.AppendMessage(m)
 	if err != nil || !appended {
@@ -94,7 +107,7 @@ func TestAppendDedup(t *testing.T) {
 		t.Fatalf("dup append: appended=%v err=%v, want false/nil", appended, err)
 	}
 	// 不同 msg_id → 正常写入
-	m2 := mkMsg(t, "m2", mkPub(t, 1), 1001, core.TypeText, "again")
+	m2 := mkMsg(t, "m2", mkPub(t, 1), 1001, core.NameText, "again")
 	if appended, err = s.AppendMessage(m2); err != nil || !appended {
 		t.Fatalf("second append: appended=%v err=%v", appended, err)
 	}
@@ -115,7 +128,7 @@ func TestAppendDedup(t *testing.T) {
 func TestHasAndGetMessage(t *testing.T) {
 	s := mustOpen(t, openTmp(t))
 	sender := mkPub(t, 3)
-	m := mkMsg(t, "mm", sender, 42, core.TypeText, "内容")
+	m := mkMsg(t, "mm", sender, 42, core.NameText, "内容")
 	if _, err := s.AppendMessage(m); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +142,7 @@ func TestHasAndGetMessage(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetMessage ok=%v err=%v", ok, err)
 	}
-	if got.Sender.Key() != sender.Key() || got.TSms != 42 || string(got.Content) != "内容" || got.MsgID != "mm" {
+	if got.Sender.Key() != sender.Key() || got.TSms != 42 || string(got.Body) != `{"text":"内容"}` || got.MsgID != "mm" {
 		t.Fatalf("roundtrip mismatch: %+v", got)
 	}
 	if _, ok, _ := s.GetMessage("ghost"); ok {
@@ -143,11 +156,11 @@ func TestQueryMessages(t *testing.T) {
 	s := mustOpen(t, openTmp(t))
 	a, b := mkPub(t, 1), mkPub(t, 2)
 	msgs := []core.Message{
-		mkMsg(t, "1", a, 100, core.TypeText, "t1"),
-		mkMsg(t, "2", b, 200, core.TypeText, "t2"),
-		mkMsg(t, "3", a, 300, core.TypeJoin, `{"pub":"x"}`),
-		mkMsg(t, "4", b, 400, core.TypeText, "t4"),
-		mkMsg(t, "5", a, 500, core.TypePresence, "{}"),
+		mkMsg(t, "1", a, 100, core.NameText, "t1"),
+		mkMsg(t, "2", b, 200, core.NameText, "t2"),
+		mkMsg(t, "3", a, 300, core.NameJoin, `{"pub":"x"}`),
+		mkMsg(t, "4", b, 400, core.NameText, "t4"),
+		mkMsg(t, "5", a, 500, core.NamePresence, "{}"),
 	}
 	for _, m := range msgs {
 		if _, err := s.AppendMessage(m); err != nil {
@@ -164,12 +177,12 @@ func TestQueryMessages(t *testing.T) {
 		want []string
 	}{
 		{"default_filters_hidden", MessageQuery{}, []string{"1", "3", "4", "5"}},
-		{"types_text", MessageQuery{Types: []string{core.TypeText}}, []string{"1", "4"}},
-		{"exclude_events", MessageQuery{ExcludeTypes: []string{core.TypeJoin, core.TypePresence}}, []string{"1", "4"}},
+		{"types_text", MessageQuery{Names: []string{core.NameText}}, []string{"1", "4"}},
+		{"exclude_events", MessageQuery{ExcludeNames: []string{core.NameJoin, core.NamePresence}}, []string{"1", "4"}},
 		{"sender_a", MessageQuery{Sender: &a}, []string{"1", "3", "5"}},
 		{"window", MessageQuery{SinceMS: 200, UntilMS: 400}, []string{"3", "4"}},
 		{"limit", MessageQuery{Limit: 2}, []string{"1", "3"}},
-		{"hidden_kept", MessageQuery{Types: []string{core.TypeText}, IncludeHidden: true}, []string{"1", "2", "4"}},
+		{"hidden_kept", MessageQuery{Names: []string{core.NameText}, IncludeHidden: true}, []string{"1", "2", "4"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -192,7 +205,7 @@ func TestQueryMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m6 := mkMsg(t, "6", b, 600, core.TypeText, "after cursor")
+	m6 := mkMsg(t, "6", b, 600, core.NameText, "after cursor")
 	if _, err := s.AppendMessage(m6); err != nil {
 		t.Fatal(err)
 	}
@@ -231,9 +244,9 @@ func TestMaxTSAndIDs(t *testing.T) {
 	}
 	pub := mkPub(t, 9)
 	for _, m := range []core.Message{
-		mkMsg(t, "x1", pub, 300, core.TypeText, ""),
-		mkMsg(t, "x2", pub, 900, core.TypeText, ""),
-		mkMsg(t, "x3", pub, 500, core.TypeText, ""),
+		mkMsg(t, "x1", pub, 300, core.NameText, ""),
+		mkMsg(t, "x2", pub, 900, core.NameText, ""),
+		mkMsg(t, "x3", pub, 500, core.NameText, ""),
 	} {
 		if _, err := s.AppendMessage(m); err != nil {
 			t.Fatal(err)
@@ -256,7 +269,7 @@ func TestMaxTSAndIDs(t *testing.T) {
 func TestHideSoftDelete(t *testing.T) {
 	tests := []struct {
 		name        string
-		content     string // hide 事件的 Content
+		payload     string // hide 事件的载荷体（未打标签）
 		wantTarget  string
 		wantApplied bool
 	}{
@@ -272,15 +285,15 @@ func TestHideSoftDelete(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := mustOpen(t, openTmp(t))
 			pub := mkPub(t, 5)
-			target := mkMsg(t, "abc", pub, 100, core.TypeText, "secret")
+			target := mkMsg(t, "abc", pub, 100, core.NameText, "secret")
 			if _, err := s.AppendMessage(target); err != nil {
 				t.Fatal(err)
 			}
-			hide := mkMsg(t, "h1", pub, 200, core.TypeHide, tc.content)
+			hide := mkMsg(t, "h1", pub, 200, core.NameHide, tc.payload)
 			if _, err := s.AppendMessage(hide); err != nil {
 				t.Fatal(err)
 			}
-			vis, err := s.QueryMessages(MessageQuery{Types: []string{core.TypeText}})
+			vis, err := s.QueryMessages(MessageQuery{Names: []string{core.NameText}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +304,7 @@ func TestHideSoftDelete(t *testing.T) {
 				t.Fatalf("target unexpectedly hidden: %v", idsOf(vis))
 			}
 			if tc.wantApplied {
-				all, err := s.QueryMessages(MessageQuery{Types: []string{core.TypeText}, IncludeHidden: true})
+				all, err := s.QueryMessages(MessageQuery{Names: []string{core.NameText}, IncludeHidden: true})
 				if err != nil || len(all) != 1 {
 					t.Fatalf("soft delete must keep data: got %v err=%v", idsOf(all), err)
 				}
@@ -305,16 +318,16 @@ func TestHideSoftDelete(t *testing.T) {
 	t.Run("out_of_order", func(t *testing.T) {
 		s := mustOpen(t, openTmp(t))
 		pub := mkPub(t, 6)
-		if _, err := s.AppendMessage(mkMsg(t, "h", pub, 200, core.TypeHide, "later")); err != nil {
+		if _, err := s.AppendMessage(mkMsg(t, "h", pub, 200, core.NameHide, "later")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.AppendMessage(mkMsg(t, "later", pub, 100, core.TypeText, "x")); err != nil {
+		if _, err := s.AppendMessage(mkMsg(t, "later", pub, 100, core.NameText, "x")); err != nil {
 			t.Fatal(err)
 		}
 		if ok, err := s.IsHidden("later"); err != nil || !ok {
 			t.Fatalf("IsHidden=%v err=%v", ok, err)
 		}
-		vis, _ := s.QueryMessages(MessageQuery{Types: []string{core.TypeText}})
+		vis, _ := s.QueryMessages(MessageQuery{Names: []string{core.NameText}})
 		if len(vis) != 0 {
 			t.Fatalf("out-of-order hide not applied: %v", idsOf(vis))
 		}
@@ -344,11 +357,11 @@ func TestRebuildFromJSONL(t *testing.T) {
 	s := mustOpen(t, dir)
 	a, b := mkPub(t, 1), mkPub(t, 2)
 	list := []core.Message{
-		mkMsg(t, "r1", a, 10, core.TypeText, "one"),
-		mkMsg(t, "r2", b, 20, core.TypeText, "two"),
-		mkMsg(t, "r3", a, 30, core.TypeText, "three"),
-		mkMsg(t, "h", b, 40, core.TypeHide, `{"target_msg_id":"r2"}`),
-		mkMsg(t, "j", a, 50, core.TypeJoin, "{}"),
+		mkMsg(t, "r1", a, 10, core.NameText, "one"),
+		mkMsg(t, "r2", b, 20, core.NameText, "two"),
+		mkMsg(t, "r3", a, 30, core.NameText, "three"),
+		mkMsg(t, "h", b, 40, core.NameHide, `{"target_msg_id":"r2"}`),
+		mkMsg(t, "j", a, 50, core.NameJoin, "{}"),
 	}
 	for _, m := range list {
 		if _, err := s.AppendMessage(m); err != nil {
@@ -372,7 +385,7 @@ func TestRebuildFromJSONL(t *testing.T) {
 		t.Fatalf("hidden mark lost after rebuild: %v %v", ok, err)
 	}
 	m, ok, err := s2.GetMessage("r3")
-	if err != nil || !ok || string(m.Content) != "three" {
+	if err != nil || !ok || string(m.Body) != `{"text":"three"}` {
 		t.Fatalf("rebuilt message lost: %v %v %+v", ok, err, m)
 	}
 	// 重建后再追加同 msg_id 仍去重
@@ -385,7 +398,7 @@ func TestTruncateCorruptTailAndSkipBadLines(t *testing.T) {
 	dir := openTmp(t)
 	os.MkdirAll(dir, 0o700)
 	jsonlPath := filepath.Join(dir, jsonlName)
-	good := core.Message{MsgID: "g1", Sender: mkPub(t, 1), TSms: 1, Type: core.TypeText, Content: []byte("ok"), Alg: core.SigEd25519}
+	good := core.Message{MsgID: "g1", Sender: mkPub(t, 1), TSms: 1, Kind: core.KindMessage, Body: []byte(`{"text":"ok"}`), Alg: core.SigEd25519}
 	raw, err := core.CanonicalJSON(good)
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +418,7 @@ func TestTruncateCorruptTailAndSkipBadLines(t *testing.T) {
 		t.Fatalf("rebuilt %d messages (%v), want only g1", n, got)
 	}
 	// 残缺尾行必须被截掉，之后追加不会粘连
-	m2 := mkMsg(t, "g2", mkPub(t, 2), 2, core.TypeText, "fresh")
+	m2 := mkMsg(t, "g2", mkPub(t, 2), 2, core.NameText, "fresh")
 	if _, err := s.AppendMessage(m2); err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +661,7 @@ func TestConcurrentAppend(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			m := mkMsg(t, string(rune('A'+i%26))+string(rune('a'+i/26)), pub, int64(i), core.TypeText, "c")
+			m := mkMsg(t, string(rune('A'+i%26))+string(rune('a'+i/26)), pub, int64(i), core.NameText, "c")
 			// 每个 msg_id 写两次：50 唯一 id × 2 并发
 			for k := 0; k < 2; k++ {
 				appended, err := s.AppendMessage(m)

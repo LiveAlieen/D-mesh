@@ -60,6 +60,36 @@
     - **GUI 控件基建（新增，全在 viewModel 纯状态机侧可单测）**：① `internal/ui/actions.go` 定义 `Action{ID, Label, Enabled, Confirm}` 与 `PanelActions()`/`RunAction(id)`——按钮集随当前面板与当前选中行变化，权限不足/不适用者**置灰不隐藏**（让用户看得见能力面）；② `ViewLine` 加性字段 `Row`（可选行序号，标题/提示行为 -1），使 game 的鼠标命中能精确映射回选中态，右击非选中行=先选中再弹菜单；③ 统一浮层栈 `overlay`：`dialog`（表单四型：text / number / choice 单选 / checks 多选，泛化现 `promptState`）与 `menu`（浮动右键菜单），Esc 只关最上层浮层；④ 原生文件选择框走 Windows `comdlg32!GetOpenFileNameW`（stdlib `syscall.NewLazyDLL`，**无 cgo、零新依赖**，守单构建铁律），**在持有本窗口 HWND 的 UI 线程上同步弹出**（对话框自带消息泵，弹窗期间主循环让位给模态框）——实测改到 `runtime.LockOSThread` 的工作线程里跑会让协程退出即销毁该线程、对话框关闭后本窗口再也收不到任何点击；非 Windows 或调用失败时该按钮**回退为手输路径文本框**并在状态行说明，功能不缺失。所有动作一律复用现有 `App` 门面方法，**协议层、`ui.App` 门面、事件结构零改动**。
     - **文案与测试**：`langs/{zh,en}.json` 新增 `gui.*`（按钮/菜单/对话框标题/确认语），`help.text` 改写为功能导览，`p.join.hint`/`p.admin.xferHint`/`p.nd.cmds` 的字母键与命令说明改为点选指引（命令名与协议 token 依 v20 铁律永不进语言文件）；`commands_test.go` 原样保留（无头通道仍全量测试），`viewmodel_test.go` 中经 `submit` 下发命令的用例（如 `TestVMThemeCommand`）改走 `RunAction`/对话框等价断言，并新增鼠标命中→行→动作、对话框四型、`/` 不再解析的回归；`progress.go` changelog 补 v25 行。验收：门禁全绿 + 真窗口逐项点完上表全部动作（含文件选择框实选、权限勾选、双主题双语言下拉）+ 双实例 E2E（GUI 点击签 join 放行 → 消息落盘送达）+ 无头 stdin 命令回归零变化。
 
+19. **v26 消息归一化（用户原话「将消息归一化所有消息和命令统一格式都是时间+具体消息+签名，具体消息分为消息，命令，扩展三个类型后面是消息或命令」；裁定「断代重来」「纯分类重构」「取消 type 靠 payload 自判别」「presence 与网盘清单并入扩展类」）**：全工程的消息与管理事件收敛成**同一种信封**——`时间 + 三类判别的正文 + 签名`。
+    - **信封**（`core.Message`）：`{msg_id, group_id, sender, ts_ms, kind, body, to?, sig_alg, sig, endorse_sig?}`，**删除 `type` 字段**；签名原文仍是 `CanonicalJSON(去掉 sig/endorse_sig 的整个信封)`，`group_id` 绑定与 `Proof.Raw` 套路不变。
+    - **三位判别** `kind` ∈ `msg`（消息）/ `cmd`（命令）/ `ext`（扩展）。
+    - **正文 = tagged union**：`body` 是**恰含一个键**的对象 `{"<名字>": <payload>}`，键即消息/命令/扩展的名字；解码端先取键、查注册表得类别，**与信封声明的 `kind` 互校**，不符即 `ErrMalformed` + 差评（封堵「把 kick 标成 msg 以绕过名单校验」）。**为何必须把名字放进 body 而非纯靠形状判别（实现约束，勿日后重议）**：`eventTarget{target}` 被 remove / kick / unban / grant_admin / revoke_admin **五个事件共用**（`internal/group/roster.go:56`），只靠字段形状在这五个上数学上不可区分。
+    - **名字注册表**集中在 `internal/core`（`KindOf(name) (kind, ok)` 一处定案，group/message/netdisk 共用）：新增一种消息或命令 = 注册表加一项 + 解码加一个分支，**信封与验签流程不动**，与 v16 签名算法可插拔同构。名字属协议 token，依 v20 铁律永不进语言文件。
+    - **归表（13 个旧 type → 三类）**：
+
+      | 旧 `type` | 新 `kind` / `body` 键 | payload |
+      |---|---|---|
+      | text | `msg` / `text` | `{body}` |
+      | hide | `cmd` / `hide` | `{target_msg_id}` |
+      | join_req | `cmd` / `join_req` | `{pub, wg_pub, ref?, pow?}` |
+      | join | `cmd` / `join` | `{pub, wg_pub, perms}` |
+      | remove | `cmd` / `remove` | `{target}`（仅本人自签有效） |
+      | kick | `cmd` / `kick` | `{target}` |
+      | unban | `cmd` / `unban` | `{target}` |
+      | perms | `cmd` / `perms` | `{target, perms}` |
+      | grant_admin | `cmd` / `grant_admin` | `{target}` |
+      | revoke_admin | `cmd` / `revoke_admin` | `{target}` |
+      | transfer | `cmd` / `transfer` | `{new_owner}`（新 owner 联署仍在信封 `endorse_sig`，v17 语义不变） |
+      | netdisk | `cmd` / `netdisk` | `{mb}` |
+      | presence | `ext` / `presence` | `{pub, last_msg_ts, offline_after}` |
+      | （新）网盘清单 | `ext` / `manifest` | 清单原文 + 上传者签名——从 transport 私有 `netdisk_manifest` 控制帧**升为正式消息**，走同一签名/去重/flood 路径；v17「严禁借 hide 承载」继续有效且更无借口 |
+
+      `ext` 与 `cmd` 同样**不进聊天气泡流**（仅 `msg` 显示），UI 按 `kind` 判定渲染。
+    - **断代重来（不留双轨）**：签名原文变→旧 `messages.jsonl`、旧名单快照的 `Proof.Raw` 在新版一律验不过，全部作废、测试与 E2E 清库重跑；不加 version 位、不写兼容解码器。**种子不受影响**：`GroupConfig` 的签名与 `group_id` 算法独立于消息信封，旧种子文件继续可用。
+    - **影响面（缺一即验签漂移）**：core（信封+常量+注册表+`MessageSigPayload`/`ProofOf`/`Verify`）、group（`EncodeEventContent` 生产端 + `dispatch` 改按 body 键分派）、message（构造、flood 与限流按 kind、`msg_id` 含新字段）、netdisk（配额事件生产端 + 清单改走 `ext/manifest`）、transport（收拢/删除 `netdisk_manifest` 帧）、backfill（增量与多源比对按 kind/名字分类）、store（落盘格式、hide 软删查找）、cmd/dmesh（无头 stdin 仍产同类事件、语义不变）、ui（按 kind 渲染，v25 控件动作不变）。
+    - **零功能变更约束（用户补充裁定「功能不变，只改交互形式」）**：本版是纯格式重构——权限判定、名单收敛、回灌比对、限流、UI 能力面一律不动，只换信封与判别方式；任何「顺手改行为」都算越界。回归基线 = v25 已有的 13 包测试断言语义逐条保持（仅按新格式改写夹具）+ 生命周期 E2E 的 chat/事件断言表结论不变。
+    - **验收**：① 门禁全绿（gofmt/vet/build/`go test -count=1` 13 包）；② 新增负例——`cmd` 内容声明为 `msg` 须拒 + 差评、五个共用 `{target}` 的命令逐一可辨、body 零键/多键/未知键拒；③ **跨包字节契约制度化**：由 `group` 侧对注册表里**每一个**名字做「签发→严格解码→断言名单生效」的全表往返（v25 查出「网盘配额自 v14 起在全网从未生效」正是生产端与解码端各写一份结构漂移所致，此后每加一个名字该测试自动覆盖）；④ 真窗口冒烟不回归（发言/成员/入群/网盘/主题/语言）；⑤ 无头全量生命周期 E2E 复跑（断言表按新 kind/名字改写，含 `ext/manifest` 新路径）；⑥ `progress.go` changelog 补 v26 行。
+
 ## 技术选型
 
 | 项 | 选择 | 理由 |

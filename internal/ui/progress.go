@@ -39,6 +39,7 @@ var changelog = []versionNote{
 	{"v23", "GUI 重写 QQ 风格浅色渲染 + /theme 深浅双主题"},
 	{"v24", "主题文件化：调色板迁 JSON（go:embed 内嵌 + 外置 themes 目录可扩展）"},
 	{"v25", "操作全面 GUI 化：按钮/右键菜单/表单取代斜杠命令（无头 stdin 语义不变）"},
+	{"v26", "消息归一化：所有消息与命令统一为「时间+具体消息+签名」，具体消息分消息/命令/扩展三类（断代重来，零功能变更）"},
 }
 
 type milestone struct {

@@ -71,14 +71,29 @@ func newEnv(t *testing.T, opt Options) *env {
 	return &env{t: t, r: r, cfg: cfg, gid: gid, creat: creat, now: now}
 }
 
-// ev 构造并签名一个事件。
-func (e *env) ev(s core.Signer, typ string, content any, ts int64) core.Message {
+// nameOf 回显消息 body 的具体名字（测试失败信息用）。
+func nameOf(m core.Message) string {
+	n, _ := core.BodyName(m.Body)
+	return n
+}
+
+// ev 构造并签名一个事件（kind 由名字查注册表得出，不手写字面量）。
+// 名字未注册时故意照原样打包：让协议端去拒，测试才测得到准入逻辑。
+func (e *env) ev(s core.Signer, name string, payload any, ts int64) core.Message {
 	e.t.Helper()
-	c, err := EncodeEventContent(content)
+	kind, ok := core.KindOf(name)
+	var c []byte
+	var err error
+	if ok {
+		c, err = EncodeEventBody(name, payload)
+	} else {
+		kind = core.KindCommand
+		c, err = core.CanonicalJSON(map[string]any{name: payload})
+	}
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	m := core.Message{Type: typ, TSms: ts, Content: c}
+	m := core.Message{Kind: kind, Body: c, TSms: ts}
 	if err := SignEvent(&m, s, e.gid); err != nil {
 		e.t.Fatal(err)
 	}
@@ -89,12 +104,12 @@ func (e *env) ev(s core.Signer, typ string, content any, ts int64) core.Message 
 func (e *env) mustApply(m core.Message) {
 	e.t.Helper()
 	if err := e.r.ApplyEvent(m); err != nil {
-		e.t.Fatalf("ApplyEvent(%s): %v", m.Type, err)
+		e.t.Fatalf("ApplyEvent(%s): %v", nameOf(m), err)
 	}
 	_, failed := e.r.FlushAll()
 	for _, f := range failed {
 		if f.MsgID == m.MsgID {
-			e.t.Fatalf("event %s failed on flush", m.Type)
+			e.t.Fatalf("event %s failed on flush", nameOf(m))
 		}
 	}
 }
@@ -103,7 +118,7 @@ func (e *env) mustApply(m core.Message) {
 func (e *env) applyNoFlush(m core.Message) {
 	e.t.Helper()
 	if err := e.r.ApplyEvent(m); err != nil {
-		e.t.Fatalf("ApplyEvent(%s): %v", m.Type, err)
+		e.t.Fatalf("ApplyEvent(%s): %v", nameOf(m), err)
 	}
 }
 
@@ -112,10 +127,10 @@ func (e *env) wantErr(m core.Message, want error) {
 	e.t.Helper()
 	err := e.r.ApplyEvent(m)
 	if err == nil {
-		e.t.Fatalf("event %s: want %v, got nil", m.Type, want)
+		e.t.Fatalf("event %s: want %v, got nil", nameOf(m), want)
 	}
 	if !errors.Is(err, want) {
-		e.t.Fatalf("event %s: want error %v, got %v", m.Type, want, err)
+		e.t.Fatalf("event %s: want error %v, got %v", nameOf(m), want, err)
 	}
 }
 
@@ -123,7 +138,7 @@ func (e *env) joinAs(carrier core.Signer, target core.PubKey, ts int64, wg core.
 	if len(perms) == 0 {
 		perms = e.cfg.DefaultPerms
 	}
-	return e.ev(carrier, core.TypeJoin, eventJoin{Pub: target, WG: wg, Perms: perms}, ts)
+	return e.ev(carrier, core.NameJoin, eventJoin{Pub: target, WG: wg, Perms: perms}, ts)
 }
 
 // bootstrapAdmin：拉入 name 密钥成员 → 升为管理 → 追加敏感权限位。
@@ -132,9 +147,9 @@ func (e *env) bootstrapAdmin(name byte, ts int64, extra ...string) (*Ed25519Sign
 	e.t.Helper()
 	admin := mkSigner(e.t, name)
 	e.mustApply(e.joinAs(e.creat, admin.Pub(), ts, mkWG(name)))
-	e.mustApply(e.ev(e.creat, core.TypeGrantAdmin, eventTarget{Target: admin.Pub()}, ts+1))
+	e.mustApply(e.ev(e.creat, core.NameGrantAdmin, eventTarget{Target: admin.Pub()}, ts+1))
 	if len(extra) > 0 {
-		e.mustApply(e.ev(e.creat, core.TypePerms, eventPerms{Target: admin.Pub(),
+		e.mustApply(e.ev(e.creat, core.NamePerms, eventPerms{Target: admin.Pub(),
 			Perms: unique(append(append([]string{}, e.cfg.DefaultPerms...), extra...))}, ts+2))
 	}
 	return admin, ts + 3
@@ -199,11 +214,11 @@ func TestGenesisCreatorPermanentTop(t *testing.T) {
 	}
 	ts := e.now
 	// 创建者不可被 remove / perms / kick（永久最高）。
-	e.wantErr(e.ev(e.creat, core.TypeRemove, eventTarget{Target: e.cfg.Creator}, ts), core.ErrNotPermitted)
-	e.wantErr(e.ev(e.creat, core.TypePerms, eventPerms{Target: e.cfg.Creator, Perms: []string{core.PermSpeak}}, ts), core.ErrNotPermitted)
+	e.wantErr(e.ev(e.creat, core.NameRemove, eventTarget{Target: e.cfg.Creator}, ts), core.ErrNotPermitted)
+	e.wantErr(e.ev(e.creat, core.NamePerms, eventPerms{Target: e.cfg.Creator, Perms: []string{core.PermSpeak}}, ts), core.ErrNotPermitted)
 	other := mkSigner(t, 77) // 非成员冒名签事件 → 伪签前验不过 sender；用群内另一事件源测 kick 层级
 	_ = other
-	e.wantErr(e.ev(e.creat, core.TypeKick, eventTarget{Target: mkSigner(t, 77).Pub()}, ts), core.ErrMalformed) // 目标非成员
+	e.wantErr(e.ev(e.creat, core.NameKick, eventTarget{Target: mkSigner(t, 77).Pub()}, ts), core.ErrMalformed) // 目标非成员
 }
 
 // --- join -------------------------------------------------------------------
@@ -266,7 +281,7 @@ func TestJoinFlows(t *testing.T) {
 		alice := mkSigner(t, 10)
 		ts := e.now - 50_000
 		e.mustApply(e.joinAs(e.creat, alice.Pub(), ts, mkWG(10)))
-		e.mustApply(e.ev(e.creat, core.TypeKick, eventTarget{Target: alice.Pub()}, ts+1))
+		e.mustApply(e.ev(e.creat, core.NameKick, eventTarget{Target: alice.Pub()}, ts+1))
 		e.wantErr(e.joinAs(e.creat, alice.Pub(), ts+2, mkWG(10)), core.ErrNotPermitted)
 	})
 	t.Run("alreadyMemberRejected", func(t *testing.T) {
@@ -294,7 +309,7 @@ func TestRemoveIsSelfOnlyAndNeverEscalates(t *testing.T) {
 	e.mustApply(e.joinAs(e.creat, bob.Pub(), ts+1, mkWG(11)))
 
 	// 他人代签 remove：无效，且绝不进黑名单（不升级为除名）。
-	e.wantErr(e.ev(bob, core.TypeRemove, eventTarget{Target: alice.Pub()}, ts+2), core.ErrNotPermitted)
+	e.wantErr(e.ev(bob, core.NameRemove, eventTarget{Target: alice.Pub()}, ts+2), core.ErrNotPermitted)
 	if e.r.IsBlacklisted(alice.Pub()) {
 		t.Fatal("proxy remove must not blacklist")
 	}
@@ -303,12 +318,12 @@ func TestRemoveIsSelfOnlyAndNeverEscalates(t *testing.T) {
 	}
 	// 具 kick 权限者代签 remove：同样只算无效（v15 不再看签名者定效果）。
 	_, _ = e.bootstrapAdmin(20, ts+2)
-	e.wantErr(e.ev(mkSigner(t, 20), core.TypeRemove, eventTarget{Target: alice.Pub()}, ts+3), core.ErrNotPermitted)
+	e.wantErr(e.ev(mkSigner(t, 20), core.NameRemove, eventTarget{Target: alice.Pub()}, ts+3), core.ErrNotPermitted)
 	if e.r.IsBlacklisted(alice.Pub()) {
 		t.Fatal("admin proxy remove must not blacklist")
 	}
 	// 本人自签 remove：退群，不进黑名单。
-	e.mustApply(e.ev(alice, core.TypeRemove, eventTarget{Target: alice.Pub()}, ts+4))
+	e.mustApply(e.ev(alice, core.NameRemove, eventTarget{Target: alice.Pub()}, ts+4))
 	if _, ok := e.r.Member(alice.Pub()); ok {
 		t.Fatal("alice should have left")
 	}
@@ -330,9 +345,9 @@ func TestKickUnbanFlows(t *testing.T) {
 	e.mustApply(e.joinAs(e.creat, alice.Pub(), ts, mkWG(10)))
 
 	// 无 kick 权限的成员不能除人。
-	e.wantErr(e.ev(alice, core.TypeKick, eventTarget{Target: admin.Pub()}, ts+1), core.ErrNotPermitted)
+	e.wantErr(e.ev(alice, core.NameKick, eventTarget{Target: admin.Pub()}, ts+1), core.ErrNotPermitted)
 	// 管理（具 kick）除名成员：删白名单 + 进黑名单。
-	e.mustApply(e.ev(admin, core.TypeKick, eventTarget{Target: alice.Pub()}, ts+2))
+	e.mustApply(e.ev(admin, core.NameKick, eventTarget{Target: alice.Pub()}, ts+2))
 	if !e.r.IsBlacklisted(alice.Pub()) {
 		t.Fatal("kicked member must be blacklisted")
 	}
@@ -347,23 +362,23 @@ func TestKickUnbanFlows(t *testing.T) {
 		t.Fatalf("ban proof: %v", err)
 	}
 	// 被除名者任何事件一律无效（黑名单优先）。
-	e.wantErr(e.ev(alice, core.TypeUnban, eventTarget{Target: alice.Pub()}, ts+3), core.ErrNotPermitted)
+	e.wantErr(e.ev(alice, core.NameUnban, eventTarget{Target: alice.Pub()}, ts+3), core.ErrNotPermitted)
 	// unban（kick 权限位=具解禁权限）恢复。
-	e.mustApply(e.ev(admin, core.TypeUnban, eventTarget{Target: alice.Pub()}, ts+4))
+	e.mustApply(e.ev(admin, core.NameUnban, eventTarget{Target: alice.Pub()}, ts+4))
 	if e.r.IsBlacklisted(alice.Pub()) {
 		t.Fatal("should be unbanned")
 	}
 	// unban 目标不在黑名单 → 无效事件。
-	e.wantErr(e.ev(admin, core.TypeUnban, eventTarget{Target: alice.Pub()}, ts+5), core.ErrMalformed)
+	e.wantErr(e.ev(admin, core.NameUnban, eventTarget{Target: alice.Pub()}, ts+5), core.ErrMalformed)
 	// unban 后可重新被拉入。
 	e.mustApply(e.joinAs(e.creat, alice.Pub(), ts+6, mkWG(10)))
 	// kick 自己 → 无效（离开请用 remove）。
-	e.wantErr(e.ev(admin, core.TypeKick, eventTarget{Target: admin.Pub()}, ts+7), core.ErrNotPermitted)
+	e.wantErr(e.ev(admin, core.NameKick, eventTarget{Target: admin.Pub()}, ts+7), core.ErrNotPermitted)
 	// 管理 kick 管理（同级）→ 无效。
 	admin2, ts2 := e.bootstrapAdmin(30, ts+8, core.PermKick)
-	e.wantErr(e.ev(admin2, core.TypeKick, eventTarget{Target: admin.Pub()}, ts2), core.ErrNotPermitted)
+	e.wantErr(e.ev(admin2, core.NameKick, eventTarget{Target: admin.Pub()}, ts2), core.ErrNotPermitted)
 	// 管理不可除名创建者/群主。
-	e.wantErr(e.ev(admin, core.TypeKick, eventTarget{Target: e.cfg.Creator}, ts2+1), core.ErrNotPermitted)
+	e.wantErr(e.ev(admin, core.NameKick, eventTarget{Target: e.cfg.Creator}, ts2+1), core.ErrNotPermitted)
 }
 
 // --- 层级权限矩阵 ------------------------------------------------------------
@@ -378,56 +393,56 @@ func TestHierarchyMatrix(t *testing.T) {
 	e.mustApply(e.joinAs(e.creat, other.Pub(), ts+1, mkWG(41)))
 
 	t.Run("adminOverMemberOK", func(t *testing.T) {
-		e.mustApply(e.ev(admin, core.TypePerms, eventPerms{Target: mallory.Pub(),
+		e.mustApply(e.ev(admin, core.NamePerms, eventPerms{Target: mallory.Pub(),
 			Perms: []string{core.PermSpeak}}, ts+2))
 		if got := e.memberPerms(mallory.Pub()); len(got) != 1 || got[0] != core.PermSpeak {
 			t.Fatalf("perms = %v", got)
 		}
 	})
 	t.Run("adminOverAdminRejected", func(t *testing.T) {
-		e.wantErr(e.ev(admin, core.TypePerms, eventPerms{Target: admin.Pub(),
+		e.wantErr(e.ev(admin, core.NamePerms, eventPerms{Target: admin.Pub(),
 			Perms: []string{core.PermSpeak}}, ts+3), core.ErrNotPermitted)
 	})
 	t.Run("memberSigningAnyAdminEventRejected", func(t *testing.T) {
-		e.wantErr(e.ev(mallory, core.TypePerms, eventPerms{Target: other.Pub(),
+		e.wantErr(e.ev(mallory, core.NamePerms, eventPerms{Target: other.Pub(),
 			Perms: []string{core.PermSpeak}}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeGrantAdmin, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeRevokeAdmin, eventTarget{Target: admin.Pub()}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeTransfer, eventTransfer{NewOwner: other.Pub()}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeNetdisk, eventNetdisk{MB: 10}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeKick, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
-		e.wantErr(e.ev(mallory, core.TypeUnban, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameGrantAdmin, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameRevokeAdmin, eventTarget{Target: admin.Pub()}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameTransfer, eventTransfer{NewOwner: other.Pub()}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameNetdisk, eventNetdisk{MB: 10}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameKick, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
+		e.wantErr(e.ev(mallory, core.NameUnban, eventTarget{Target: other.Pub()}, ts+4), core.ErrNotPermitted)
 	})
 	t.Run("adminCannotGrantAdminOrCarry", func(t *testing.T) {
-		e.wantErr(e.ev(admin, core.TypeGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+5), core.ErrNotPermitted)
-		e.wantErr(e.ev(admin, core.TypePerms, eventPerms{Target: mallory.Pub(),
+		e.wantErr(e.ev(admin, core.NameGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+5), core.ErrNotPermitted)
+		e.wantErr(e.ev(admin, core.NamePerms, eventPerms{Target: mallory.Pub(),
 			Perms: []string{core.PermSpeak, core.PermCarry}}, ts+5), core.ErrNotPermitted)
 	})
 	t.Run("ownerGrantsTierGatedToAdmin", func(t *testing.T) {
-		e.mustApply(e.ev(e.creat, core.TypePerms, eventPerms{Target: admin.Pub(),
+		e.mustApply(e.ev(e.creat, core.NamePerms, eventPerms{Target: admin.Pub(),
 			Perms: []string{core.PermSpeak, core.PermReceive, core.PermCarry}}, ts+6))
 		if !e.r.HasPerm(admin.Pub(), core.PermCarry) {
 			t.Fatal("admin should have carry")
 		}
 	})
 	t.Run("grantAndRevokeAdmin", func(t *testing.T) {
-		e.mustApply(e.ev(e.creat, core.TypeGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+7))
+		e.mustApply(e.ev(e.creat, core.NameGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+7))
 		if e.r.TierOf(mallory.Pub()) != core.TierAdmin {
 			t.Fatal("mallory should be admin")
 		}
-		e.wantErr(e.ev(e.creat, core.TypeGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+8), core.ErrMalformed)
-		e.mustApply(e.ev(e.creat, core.TypeRevokeAdmin, eventTarget{Target: mallory.Pub()}, ts+9))
+		e.wantErr(e.ev(e.creat, core.NameGrantAdmin, eventTarget{Target: mallory.Pub()}, ts+8), core.ErrMalformed)
+		e.mustApply(e.ev(e.creat, core.NameRevokeAdmin, eventTarget{Target: mallory.Pub()}, ts+9))
 		if e.r.TierOf(mallory.Pub()) != core.TierMember {
 			t.Fatal("mallory revoked should be member")
 		}
-		e.wantErr(e.ev(e.creat, core.TypeRevokeAdmin, eventTarget{Target: mallory.Pub()}, ts+10), core.ErrMalformed)
+		e.wantErr(e.ev(e.creat, core.NameRevokeAdmin, eventTarget{Target: mallory.Pub()}, ts+10), core.ErrMalformed)
 	})
 	t.Run("badPermNamesRejected", func(t *testing.T) {
-		e.wantErr(e.ev(e.creat, core.TypePerms, eventPerms{Target: mallory.Pub(),
+		e.wantErr(e.ev(e.creat, core.NamePerms, eventPerms{Target: mallory.Pub(),
 			Perms: []string{"fly"}}, ts+11), core.ErrMalformed)
-		e.wantErr(e.ev(e.creat, core.TypePerms, eventPerms{Target: mallory.Pub(),
+		e.wantErr(e.ev(e.creat, core.NamePerms, eventPerms{Target: mallory.Pub(),
 			Perms: nil}, ts+11), core.ErrMalformed)
-		e.wantErr(e.ev(e.creat, core.TypePerms, eventPerms{Target: mallory.Pub(),
+		e.wantErr(e.ev(e.creat, core.NamePerms, eventPerms{Target: mallory.Pub(),
 			Perms: []string{core.PermSpeak, core.PermSpeak}}, ts+11), core.ErrMalformed)
 	})
 }
@@ -441,10 +456,10 @@ func TestTransferWithEndorsement(t *testing.T) {
 	carol := mkSigner(t, 45)
 
 	t.Run("noEndorsementRejected", func(t *testing.T) {
-		e.wantErr(e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts), core.ErrNotPermitted)
+		e.wantErr(e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts), core.ErrNotPermitted)
 	})
 	t.Run("wrongEndorserRejected", func(t *testing.T) {
-		m := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+1)
+		m := e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+1)
 		if err := EndorseEvent(&m, mkSigner(t, 41)); err != nil {
 			t.Fatal(err)
 		}
@@ -452,14 +467,14 @@ func TestTransferWithEndorsement(t *testing.T) {
 	})
 	t.Run("memberSignedTransferRejected", func(t *testing.T) {
 		e.mustApply(e.joinAs(e.creat, carol.Pub(), ts+2, mkWG(45)))
-		m := e.ev(carol, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+3)
+		m := e.ev(carol, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+3)
 		if err := EndorseEvent(&m, admin); err != nil {
 			t.Fatal(err)
 		}
 		e.wantErr(m, core.ErrNotPermitted)
 	})
 	t.Run("validTransfer", func(t *testing.T) {
-		m := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+4)
+		m := e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+4)
 		if err := EndorseEvent(&m, admin); err != nil {
 			t.Fatal(err)
 		}
@@ -475,16 +490,16 @@ func TestTransferWithEndorsement(t *testing.T) {
 		}
 	})
 	t.Run("transferToSelfRejected", func(t *testing.T) {
-		m := e.ev(admin, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+5)
+		m := e.ev(admin, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+5)
 		if err := EndorseEvent(&m, admin); err != nil {
 			t.Fatal(err)
 		}
 		e.wantErr(m, core.ErrMalformed)
 	})
 	t.Run("chainTransferDemotesOldOwner", func(t *testing.T) {
-		e.mustApply(e.ev(admin, core.TypePerms, eventPerms{Target: carol.Pub(),
+		e.mustApply(e.ev(admin, core.NamePerms, eventPerms{Target: carol.Pub(),
 			Perms: []string{core.PermSpeak, core.PermReceive, core.PermTransfer}}, ts+6))
-		m := e.ev(admin, core.TypeTransfer, eventTransfer{NewOwner: carol.Pub()}, ts+7)
+		m := e.ev(admin, core.NameTransfer, eventTransfer{NewOwner: carol.Pub()}, ts+7)
 		if err := EndorseEvent(&m, carol); err != nil {
 			t.Fatal(err)
 		}
@@ -497,7 +512,7 @@ func TestTransferWithEndorsement(t *testing.T) {
 		}
 	})
 	t.Run("creatorCanKickOwnerAndPointerFallsBack", func(t *testing.T) {
-		e.mustApply(e.ev(e.creat, core.TypeKick, eventTarget{Target: carol.Pub()}, ts+8))
+		e.mustApply(e.ev(e.creat, core.NameKick, eventTarget{Target: carol.Pub()}, ts+8))
 		if !e.r.IsBlacklisted(carol.Pub()) {
 			t.Fatal("owner carol should be kicked")
 		}
@@ -508,13 +523,17 @@ func TestTransferWithEndorsement(t *testing.T) {
 }
 
 // evTo 构造带 to 的名单事件（v17①：唯一允许 to 非空的是 transfer）。
-func (e *env) evTo(s core.Signer, to *core.PubKey, typ string, content any, ts int64) core.Message {
+func (e *env) evTo(s core.Signer, to *core.PubKey, name string, payload any, ts int64) core.Message {
 	e.t.Helper()
-	c, err := EncodeEventContent(content)
+	kind, ok := core.KindOf(name)
+	if !ok {
+		e.t.Fatalf("unknown body name %q", name)
+	}
+	c, err := EncodeEventBody(name, payload)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	m := core.Message{Type: typ, TSms: ts, Content: c, To: to}
+	m := core.Message{Kind: kind, Body: c, TSms: ts, To: to}
 	if err := SignEvent(&m, s, e.gid); err != nil {
 		e.t.Fatal(err)
 	}
@@ -529,7 +548,7 @@ func TestTransferDirectedAndSelfClaim(t *testing.T) {
 
 	t.Run("directedEndorsedTransferAdopted", func(t *testing.T) {
 		// 提案定向（to=新 owner）→ 联署后的生效原文仍含 to → 广播采纳。
-		m := e.evTo(e.creat, ptrOf(admin.Pub()), core.TypeTransfer,
+		m := e.evTo(e.creat, ptrOf(admin.Pub()), core.NameTransfer,
 			eventTransfer{NewOwner: admin.Pub()}, ts)
 		if err := EndorseEvent(&m, admin); err != nil {
 			t.Fatal(err)
@@ -541,7 +560,7 @@ func TestTransferDirectedAndSelfClaim(t *testing.T) {
 	})
 	t.Run("directedToMismatchRejected", func(t *testing.T) {
 		e.mustApply(e.joinAs(e.creat, carol.Pub(), ts+1, mkWG(45)))
-		m := e.evTo(e.creat, ptrOf(carol.Pub()), core.TypeTransfer,
+		m := e.evTo(e.creat, ptrOf(carol.Pub()), core.NameTransfer,
 			eventTransfer{NewOwner: admin.Pub()}, ts+2)
 		if err := EndorseEvent(&m, admin); err != nil {
 			t.Fatal(err)
@@ -550,13 +569,13 @@ func TestTransferDirectedAndSelfClaim(t *testing.T) {
 	})
 	t.Run("nonTransferDirectedRejected", func(t *testing.T) {
 		dave := mkSigner(t, 46)
-		m := e.evTo(e.creat, ptrOf(dave.Pub()), core.TypeJoin,
+		m := e.evTo(e.creat, ptrOf(dave.Pub()), core.NameJoin,
 			eventJoin{Pub: dave.Pub(), WG: mkWG(46), Perms: e.cfg.DefaultPerms}, ts+3)
 		e.wantErr(m, core.ErrMalformed)
 	})
 	t.Run("creatorSelfClaimReclaimsOwnership", func(t *testing.T) {
 		// 自领快捷路径（v17 C.4）：创建者签原文 + 自联署一步生效。
-		m := e.evTo(e.creat, ptrOf(e.cfg.Creator), core.TypeTransfer,
+		m := e.evTo(e.creat, ptrOf(e.cfg.Creator), core.NameTransfer,
 			eventTransfer{NewOwner: e.cfg.Creator}, ts+4)
 		if err := EndorseEvent(&m, e.creat); err != nil {
 			t.Fatal(err)
@@ -570,7 +589,7 @@ func TestTransferDirectedAndSelfClaim(t *testing.T) {
 		}
 	})
 	t.Run("transferToCurrentOwnerRejected", func(t *testing.T) {
-		m := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: e.cfg.Creator}, ts+5)
+		m := e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: e.cfg.Creator}, ts+5)
 		if err := EndorseEvent(&m, e.creat); err != nil {
 			t.Fatal(err)
 		}
@@ -578,13 +597,13 @@ func TestTransferDirectedAndSelfClaim(t *testing.T) {
 	})
 	t.Run("nonCreatorSelfClaimRejected", func(t *testing.T) {
 		// 先把群主位交给 admin，再让 admin 自领自签：非创建者无效。
-		m1 := e.evTo(e.creat, ptrOf(admin.Pub()), core.TypeTransfer,
+		m1 := e.evTo(e.creat, ptrOf(admin.Pub()), core.NameTransfer,
 			eventTransfer{NewOwner: admin.Pub()}, ts+6)
 		if err := EndorseEvent(&m1, admin); err != nil {
 			t.Fatal(err)
 		}
 		e.mustApply(m1)
-		m2 := e.ev(admin, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+7)
+		m2 := e.ev(admin, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts+7)
 		if err := EndorseEvent(&m2, admin); err != nil {
 			t.Fatal(err)
 		}

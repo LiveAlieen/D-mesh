@@ -112,6 +112,17 @@
   - 遗留：网盘「上传文件」实传到落盘需两个可写主机，本机环境只跑得起一个可写端，故上传块传输仍按环境限制超时（选择框→执行链路本身已验证通畅）。
 
 
+## v26 — 消息归一化：统一信封 = 时间 + 三类正文 + 签名
+- **原话**：「将消息归一化所有消息和命令统一格式都是时间+具体消息+签名，具体消息分为消息，命令，扩展三个类型后面是消息或命令」（2026-09-27）
+- **追问裁定**：① 兼容策略 = 「断代重来」——签名原文一变，旧 `messages.jsonl` 与名单快照里的 `Proof.Raw` 在新版一律验不过，直接作废清库重跑，不加 version 位、不养双解码器。② 「命令」语义 = 「纯分类重构」——指把改名单/改群配置的既有事件归成命令大类，语义与权限模型不变；**不**引入「一条消息让对端执行某动作」的新协议语义。③ 二级类型位 = 「取消 type，靠 payload 自判别」——信封里删掉 `type` 字段。④ 扩展类边界 = 「并入扩展类，同一信封」——`presence` 心跳与网盘清单都升为正式消息走同一信封（清单不再走 transport 私有控制帧）。
+- **补充裁定（开工中，2026-09-27）**：「功能不变，只改交互形式」「具体格式就按照我的要求来」——本版是**纯格式重构**：所有功能的行为、权限判定、语义一律保持不变，只把消息与命令收敛成统一信封；不得借归一化之名增删任何能力或改变任何判定路径（网盘清单并入 `ext` 同样只换承载形式，同步语义不变）。
+- 定稿（PLAN 条目 19）：信封改 `{msg_id, group_id, sender, ts_ms, kind, body, to?, sig_alg, sig, endorse_sig?}`；`kind` ∈ `msg`/`cmd`/`ext`；`body` 是**恰一个键**的 tagged union `{"<名字>": <payload>}`，命令/消息/扩展的名字即由该键承载，并与 `kind` **互校**（注册表定类别，声明与实符不符即 malformed + 差评，防「把 kick 伪装成 msg」绕名单校验）。**采用 tagged union 是实现约束而非风格选择**：`eventTarget{target}` 被 remove/kick/unban/grant_admin/revoke_admin 五事件共用（`internal/group/roster.go:56`），纯字段形状在这五个上数学上不可区分。名字注册表集中在 `internal/core`，加命令=注册表加一项 + 一个解码分支，信封与验签流程不动（与 v16 算法可插拔同构）；名字属协议 token，依 v20 铁律永不进语言文件。13 个旧 type 归表：text→`msg/text`；hide/join_req/join/remove/kick/unban/perms/grant_admin/revoke_admin/transfer/netdisk→`cmd/*`（transfer 的联署仍在信封 `endorse_sig`，v17 语义不变）；presence→`ext/presence`；网盘清单→新增 `ext/manifest`。种子 `GroupConfig` 的签名路径独立于消息信封，不受影响，旧种子文件继续可用。验收在门禁/E2E 之外加一条硬要求：**`group` 侧对注册表里每一个名字做「签发→严格解码→断言生效」全表往返**（v25 网盘配额「生产端与解码端各写一份结构必然漂移」的教训制度化）。
+- **落实记录（2026-09-27）**：统一信封与名字注册表落地——新增 `internal/core/body.go` 为唯一权威（`KindOf/IsKnownName/Names/MakeBody/BodyName/BodyPayload/CheckBody/TextBody/TextOf`，14 个名字），信封里 `type` 字段删除，`body=CanonicalJSON({"<名字>":payload})`；`group/message/store/netdisk/neighbor/ui/backfill` 全部改读新信封；签名原文随之改变（按「断代重来」裁定，旧库直接作废清库重跑，不留双解码器）；`internal/group/registry_contract_test.go` 钉死注册表每一项的「签发→严格解码→断言生效」全表往返；`progress.go` 补 v26 行。门禁=gofmt/vet 静默、`go test -count=1 ./...` 13 包全绿。生命周期 E2E 清库重跑 `E2E_EXIT=0`：聊天 7/7、事件 7/7、`kind↔名字互校 OK（谎报 0 / 无判别位 0）`、三类分布 `{cmd:9, ext:8, msg:4}`、错误种子 D 处理 0 次。真窗口冒烟（验收④）以「1 个 GUI 节点 A + dmesh-echo 申请端」实测：入群（两条 GUI 路径）、发言（双向，气泡/头像/名·时间行齐）、成员（层级与在场回显）、任命管理（`cmd/grant_admin` 落盘）、网盘配额（数字框 6→`{"mb":6}` 生效、12.0→18.0MiB，说明 v25 跨包契约修复在新信封下仍成立）、`cmd/netdisk` 与 `ext/presence` 混排于同一 `messages.jsonl` 各归其类、主题切 dark 并重启恢复、语言切 en 整窗重渲染、双确认取消、关窗干净退出（`local_shutdown` / `tunnel closed`）。
+  - **配套改动（测试口径，非产品行为）**：`AppendMessage` 的真相源是 `CanonicalJSON(m)`，故 `body` 在 `messages.jsonl` 里以 **base64** 出现，v25 时代直接 grep 明文字符串的断言全部失效；`run/life/lifecycle.sh` 改提供 `nmcount/txthas/pollnm`（先 base64 解码再按名字/文本计数）。这是断言重写的唯一原因。
+  - **测试环境说明**：生产节点从不自发 `join_req`（只有 `ApproveJoin`/`RejectJoin` 路径），故 GUI「入群」实测的申请端必须用 `cmd/dmesh-echo`；GUI 窗口只能由 `explorer.exe <file>.bat` 拉起（ShellExecute 分配真实控制台）——`Start-Process` 与 `cmd start` 的 stdin 非交互，会命中 `stdinInteractive()==false` 而无头运行、连 `<data>/dmesh.log` 都不写。
+  - **诚实报备（既有缺陷，与本版无关）**：join 与该成员心跳竞态时 A 曾对 F 的 presence 打一次差评（`event_not_permitted … sender is not a member`）；重启后面板短暂显示 成员=0，需一次刷新才回正；echo 端在获批后仍继续重试 `join_req`。三者均为 v26 之前既有行为，本版未改判定路径（「功能不变」裁定），留待后续版本处理。
+
+
 ## 附：口头问答定论（未成版本，但为消歧义记录）
 - 「发送消息的时间戳是怎么来的？」→ 定论：`ts_ms` 为**发送者本机时钟自报 + 本人签名锁死**；接收端另存本地收到时刻仅参考；时钟偏差/虚报无法证伪（已知风险），故**一切安全判定不依赖时间戳真值**（在场=展示属性，名单收敛=靠签名链+多源比对而非 ts）。
 - 「重说生命周期」（两次）→ 均为纯文字复述，无设计变更。

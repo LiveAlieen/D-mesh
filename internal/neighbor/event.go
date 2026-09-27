@@ -62,8 +62,8 @@ func (nt *Table) AddCandidate(pub core.PubKey, wg core.WGPub, addr string) {
 // 即时断连（PLAN：除名/拉黑事件触发的即时断连）：
 //
 //   - remove：仅本人自签有效（v15），故 sender 即退群者 → 断连；
-//   - kick：目标在 Content 里。本包对 Content 编码做宽松解析（见 kickTarget），
-//     group 规范编码 {"pub":{...}} / {"target":...} / target_pub / kick_pub、
+//   - kick：目标在 body 里。本包对 body 编码做宽松解析（见 kickTarget），
+//     先剥 {"kick":…} 标签，再认 {"pub":{...}} / {"target":...} / target_pub / kick_pub、
 //     裸 hex 或 "alg:hex" 字符串、以及定向 To 字段都能识别；
 //   - unban：无需动作（候选补充/重连由上层重新 AddCandidate）；
 //   - 其他类型：不动作（批量清扫走巡检里的 Roster 兜底）。
@@ -71,13 +71,17 @@ func (nt *Table) AddCandidate(pub core.PubKey, wg core.WGPub, addr string) {
 // message/group 层若能直接拿到目标 pubkey，推荐改用 Drop(target, ReasonKick)，
 // 语义最确切；本入口是为「只传事件原文」的接线方便。
 func (nt *Table) HandleRosterEvent(m core.Message) {
-	switch m.Type {
-	case core.TypeRemove:
+	name, err := core.CheckBody(m.Kind, m.Body)
+	if err != nil {
+		return // 大类与标签不符（伪装）一律不动作
+	}
+	switch name {
+	case core.NameRemove:
 		if !nt.cfg.LocalPub.IsZero() && nt.cfg.LocalPub.Equal(m.Sender) {
 			return
 		}
 		nt.Drop(m.Sender, ReasonRemove)
-	case core.TypeKick:
+	case core.NameKick:
 		if target, ok := kickTarget(m); ok {
 			if !nt.cfg.LocalPub.IsZero() && nt.cfg.LocalPub.Equal(target) {
 				return // 被踢的是本机：断邻居无意义，善后由 group/backfill 层处理
@@ -89,10 +93,19 @@ func (nt *Table) HandleRosterEvent(m core.Message) {
 }
 
 // kickTarget 从 kick 事件中宽松解析被踢 pubkey（见 HandleRosterEvent 注释）。
-// 优先 Content 规范编码；Content 无法解析时退回定向字段 To。
+// 优先 body 规范编码 {"kick":{"target":…}}；载荷写成裸字符串（hex 或 "alg:hex"）
+// 也认；两者都解不出时退回定向字段 To。
 func kickTarget(m core.Message) (core.PubKey, bool) {
 	var node map[string]any
-	if err := json.Unmarshal(m.Content, &node); err == nil {
+	if err := json.Unmarshal(m.Body, &node); err == nil {
+		switch inner := node[core.NameKick].(type) {
+		case map[string]any:
+			node = inner
+		case string:
+			if p, ok := parsePubString(inner); ok {
+				return p, true
+			}
+		}
 		for _, key := range []string{"pub", "target", "target_pub", "kick_pub"} {
 			v, ok := node[key]
 			if !ok {
@@ -101,13 +114,6 @@ func kickTarget(m core.Message) (core.PubKey, bool) {
 			if p, ok := decodePub(v); ok {
 				return p, true
 			}
-		}
-	}
-	// Content 直接是字符串（hex 或 "alg:hex"）
-	var s string
-	if err := json.Unmarshal(m.Content, &s); err == nil {
-		if p, ok := parsePubString(s); ok {
-			return p, true
 		}
 	}
 	if m.To != nil && !m.To.IsZero() {

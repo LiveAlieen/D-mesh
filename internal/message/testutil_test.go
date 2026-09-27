@@ -97,7 +97,8 @@ func (r *fakeRoster) Member(p core.PubKey) (core.MemberEntry, bool) {
 func (r *fakeRoster) ApplyEvent(m core.Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err, ok := r.applyErr[m.Type]; ok {
+	name, _ := core.BodyName(m.Body)
+	if err, ok := r.applyErr[name]; ok {
 		return err
 	}
 	r.applied = append(r.applied, m)
@@ -211,11 +212,15 @@ func (c *fixedClock) Advance(d time.Duration) {
 
 func mustText(t *testing.T, s core.Signer, tsMS int64, body string, msgID string) core.Message {
 	t.Helper()
+	tb, err := core.TextBody(body)
+	if err != nil {
+		t.Fatalf("text body: %v", err)
+	}
 	m, err := NewMessage(s, testGroupID, &core.Message{
-		Type:    core.TypeText,
-		TSms:    tsMS,
-		Content: []byte(body),
-		MsgID:   msgID,
+		Kind:  core.KindMessage,
+		TSms:  tsMS,
+		Body:  tb,
+		MsgID: msgID,
 	}, nil)
 	if err != nil {
 		t.Fatalf("NewMessage: %v", err)

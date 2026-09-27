@@ -87,7 +87,7 @@ func TestCanonicalJSONKeepsInt64Precision(t *testing.T) {
 	if string(got) != `{"ts":9007199254740993}` {
 		t.Fatalf("int64 precision lost: %s", got)
 	}
-	m := Message{MsgID: "m", TSms: big, Type: TypeText, Alg: SigEd25519}
+	m := Message{MsgID: "m", TSms: big, Kind: KindMessage, Body: []byte(`{"text":"hi"}`), Alg: SigEd25519}
 	payload, err := MessageSigPayload(m)
 	if err != nil {
 		t.Fatal(err)
@@ -305,8 +305,8 @@ func TestMessageSigPayloadExcludesSigsOnly(t *testing.T) {
 		GroupID: mustGroupID(t, sampleGroupConfig()),
 		Sender:  PubKey{Alg: SigEd25519, Bytes: bytes.Repeat([]byte{2}, 32)},
 		TSms:    1_700_000_001_000,
-		Type:    TypeText,
-		Content: []byte("你好，P2P"),
+		Kind:    KindMessage,
+		Body:    []byte(`{"text":"你好，P2P"}`),
 		Alg:     SigEd25519,
 	}
 	base, err := MessageSigPayload(m)
@@ -360,8 +360,8 @@ func TestMessageSigPayloadExcludesSigsOnly(t *testing.T) {
 	}
 	for name, p := range map[string][]byte{
 		"msg_id":  mut(func(c *Message) { c.MsgID = "01JABD" }),
-		"content": mut(func(c *Message) { c.Content = []byte("changed") }),
-		"type":    mut(func(c *Message) { c.Type = TypeHide }),
+		"body":    mut(func(c *Message) { c.Body = []byte(`{"hide":{"target_msg_id":"x"}}`) }),
+		"kind":    mut(func(c *Message) { c.Kind = KindCommand }),
 		"ts":      mut(func(c *Message) { c.TSms++ }),
 		"group":   mut(func(c *Message) { c.GroupID[0] ^= 0x01 }),
 		"sig_alg": mut(func(c *Message) { c.Alg = SigAlg("sm2") }),
@@ -385,8 +385,8 @@ func TestProofOfAndVerifyProof(t *testing.T) {
 		GroupID: mustGroupID(t, sampleGroupConfig()),
 		Sender:  carrier,
 		TSms:    1_700_000_002_000,
-		Type:    TypeJoin,
-		Content: []byte(`{"pub":"newbie"}`),
+		Kind:    KindCommand,
+		Body:    []byte(`{"join":{"pub":"newbie"}}`),
 		Alg:     alg,
 	}
 	if _, err := ProofOf(ev); err == nil {

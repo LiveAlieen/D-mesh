@@ -168,7 +168,7 @@ func TestIngestVerifyRejectionsPenalize(t *testing.T) {
 		mutate     func(*core.Message)
 		wantReason RejectReason
 	}{
-		{"tampered content", func(m *core.Message) { m.Content = []byte("tampered!") }, ReasonBadSig},
+		{"tampered body", func(m *core.Message) { m.Body = []byte(`{"text":"tampered!"}`) }, ReasonBadSig},
 		{"unknown sig_alg (v16 拒绝采纳+差评)", func(m *core.Message) {
 			m.Alg = core.SigAlg("sm9")
 			m.Sender.Alg = m.Alg
@@ -193,6 +193,80 @@ func TestIngestVerifyRejectionsPenalize(t *testing.T) {
 			}
 			if env2.tr.total() != 0 {
 				t.Fatal("invalid message must not be forwarded")
+			}
+		})
+	}
+}
+
+// TestKindLieRejectedAndPenalized 是 PLAN v26 验收②的引擎侧负例：正文装的是 cmd 的
+// kick，信封却把 kind 谎报成 msg（想躲开名单校验、混进气泡流），或干脆不声明 kind。
+// 三道关都拦得住，且每一道都留下差评、绝不转发：
+//
+//	⓪ 本机根本签不出这种原文（NewMessage 在发签前互校 kind↔body）；
+//	① 入站帧在结构关（DecodeFrame）就被拒——谎报者拿到的是 malformed_frame 差评；
+//	② 已解码消息（store/backfill 复验同一条规则）走到路由步，按互校拒为 unknown_name。
+func TestKindLieRejectedAndPenalized(t *testing.T) {
+	body, err := core.MakeBody(core.NameKick, map[string]any{"target": "00"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// lie 手工拼信封并对「谎报后的原文」签名：合法签名 + 不符的判别位。
+	lie := func(t *testing.T, s core.Signer, kind string, ts int64, msgID string) core.Message {
+		t.Helper()
+		m := core.Message{MsgID: msgID, GroupID: testGroupID, Sender: s.Pub(),
+			Alg: s.Alg(), TSms: ts, Kind: kind, Body: body}
+		raw, err := core.MessageSigPayload(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig, err := s.Sign(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Sig = sig
+		return m
+	}
+
+	t.Run("签发端拒", func(t *testing.T) {
+		e := newEnv(t, true)
+		s, _ := e.otherMember()
+		if _, err := NewMessage(s, testGroupID, &core.Message{
+			Kind: core.KindMessage, TSms: 1700000000400, Body: body}, nil); err == nil {
+			t.Fatal("NewMessage 竟签出了 kind 谎报的原文")
+		}
+	})
+
+	cases := []struct {
+		desc   string
+		kind   string
+		ts     int64
+		msgID  string
+		reason RejectReason
+	}{{"kick 伪装成 msg（入站帧）", core.KindMessage, 1700000000500, "lie-frame", ReasonMalformed},
+		{"kick 不声明 kind（入站帧）", "", 1700000000501, "lie-nokind", ReasonMalformed},
+		{"kick 伪装成 msg（已解码复验）", core.KindMessage, 1700000000502, "lie-ingest", ReasonUnknownName},
+		{"kick 不声明 kind（已解码复验）", "", 1700000000503, "lie-ingest2", ReasonUnknownName}}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			e := newEnv(t, true)
+			s, sender := e.otherMember()
+			m := lie(t, s, tc.kind, tc.ts, tc.msgID)
+			var out Outcome
+			if tc.reason == ReasonMalformed {
+				out = e.eng.Ingest(sender, frameOf(t, m))
+			} else {
+				out = e.eng.IngestMessage(sender, m)
+			}
+			if out.Accepted || out.Reason != tc.reason {
+				t.Fatalf("want reject/%s, got %+v (err %v)", tc.reason, out, out.Err)
+			}
+			if _, _, _, _, _, _, pens := e.rec.snapshotCounts(); len(pens) != 1 || pens[0] != tc.reason {
+				t.Fatalf("谎报者未差评或差评原因错: %v", pens)
+			}
+			if e.tr.total() != 0 {
+				t.Fatal("谎报正文不得转发")
 			}
 		})
 	}
@@ -330,7 +404,7 @@ func TestRosterEventSamePathNoChat(t *testing.T) {
 	kicker := newTestSigner()
 	e.ros.addMember(kicker.pub, core.RoleAdmin, core.PermKick, core.PermSpeak)
 	m, err := NewMessage(kicker, testGroupID, &core.Message{
-		Type: core.TypeKick, TSms: 1700000000000, Content: []byte(`{"pub":"aa"}`),
+		Kind: core.KindCommand, TSms: 1700000000000, Body: []byte(`{"kick":{"pub":"aa"}}`),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +427,7 @@ func TestRosterEventSamePathNoChat(t *testing.T) {
 	// 越权事件（ApplyEvent 拒绝）→ 丢弃 + 差评 + 不转发
 	e2 := newEnv(t, true)
 	e2.ros.mu.Lock()
-	e2.ros.applyErr[core.TypeKick] = fmt.Errorf("roster: %w: tier too low", core.ErrNotPermitted)
+	e2.ros.applyErr[core.NameKick] = fmt.Errorf("roster: %w: tier too low", core.ErrNotPermitted)
 	e2.ros.mu.Unlock()
 	out2 := e2.eng.Ingest(kicker.pub, frameOf(t, m))
 	if out2.Accepted || out2.Reason != ReasonOverreach {
@@ -384,7 +458,7 @@ func TestJoinReqRelaysToOnlineCarriersOnly(t *testing.T) {
 	// 本机具 carry（newEnv 已给）→ 本地受理
 	newcomer := newTestSigner()
 	jr, err := NewMessage(newcomer, testGroupID, &core.Message{
-		Type: core.TypeJoinReq, TSms: now.UnixMilli(), Content: []byte("seed-info"),
+		Kind: core.KindCommand, TSms: now.UnixMilli(), Body: []byte(`{"join_req":"seed-info"}`),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -489,9 +563,9 @@ func TestHideRules(t *testing.T) {
 	// 4. hide 指向自身 msg_id → 结构性拒绝 + 差评
 	e4 := newEnv(t, true)
 	e4.ros.addMember(s.pub, core.RoleMember, core.PermSpeak)
-	selfHC, _ := EncodeHideContent("self-x")
+	selfHC, _ := EncodeHideBody("self-x")
 	selfHide, err := NewMessage(s, testGroupID, &core.Message{
-		Type: core.TypeHide, TSms: 1700000000006, Content: selfHC, MsgID: "self-x",
+		Kind: core.KindCommand, TSms: 1700000000006, Body: selfHC, MsgID: "self-x",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -646,7 +720,7 @@ func TestNilRosterPureLogicMode(t *testing.T) {
 	if !out.Accepted || out.Kind != KindChat {
 		t.Fatalf("%+v", out)
 	}
-	ev, _ := NewMessage(s, testGroupID, &core.Message{Type: core.TypeJoin, TSms: 1, Content: []byte("e")}, nil)
+	ev, _ := NewMessage(s, testGroupID, &core.Message{Kind: core.KindCommand, TSms: 1, Body: []byte(`{"join":"e"}`)}, nil)
 	out2 := e.eng.Ingest(s.pub, frameOf(t, ev))
 	if !out2.Accepted || out2.Kind != KindRosterEvent {
 		t.Fatalf("%+v", out2)
@@ -668,9 +742,9 @@ func proposalEnv(t *testing.T) (*env, *testSigner, *testSigner) {
 func makeProposal(t *testing.T, owner *testSigner, to core.PubKey, ts int64) core.Message {
 	t.Helper()
 	m, err := NewMessage(owner, testGroupID, &core.Message{
-		Type: core.TypeTransfer, TSms: ts,
-		Content: []byte(`{"new_owner":{"alg":"ed25519","bytes":"aabb"}}`),
-		To:      &to,
+		Kind: core.KindCommand, TSms: ts,
+		Body: []byte(`{"transfer":{"new_owner":{"alg":"ed25519","bytes":"aabb"}}}`),
+		To:   &to,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)

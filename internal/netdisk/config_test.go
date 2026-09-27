@@ -2,7 +2,6 @@ package netdisk
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"testing"
 
@@ -17,15 +16,15 @@ func TestNetdiskConfigEvent(t *testing.T) {
 	for _, mb := range []int{0, 1, 256} {
 		msg, err := MakeNetdiskEvent(owner, gid, mb, 1000)
 		mustOK(t, err)
-		if msg.Type != core.TypeNetdisk {
-			t.Fatal("type")
+		if name, err := core.CheckBody(msg.Kind, msg.Body); err != nil || name != core.NameNetdisk {
+			t.Fatalf("kind/name = %q/%q err=%v", msg.Kind, name, err)
 		}
 		raw, err := core.MessageSigPayload(msg)
 		mustOK(t, err)
 		if err := core.Verify(msg.Sender, raw, msg.Sig); err != nil {
 			t.Fatalf("mb=%d event signature invalid: %v", mb, err)
 		}
-		got, err := ValidateNetdiskContent(msg.Content)
+		got, err := ValidateNetdiskBody(msg.Body)
 		mustOK(t, err)
 		if got != mb {
 			t.Fatalf("roundtrip %d != %d", got, mb)
@@ -36,19 +35,23 @@ func TestNetdiskConfigEvent(t *testing.T) {
 		if _, err := MakeNetdiskEvent(owner, gid, mb, 1); !errors.Is(err, ErrBadQuotaMB) {
 			t.Fatalf("mb=%d must be rejected at signing, got %v", mb, err)
 		}
-		content, _ := json.Marshal(map[string]any{"mb": mb})
-		if _, err := ValidateNetdiskContent(content); !errors.Is(err, ErrBadQuotaMB) {
+		content, _ := core.MakeBody(core.NameNetdisk, map[string]any{"mb": mb})
+		if _, err := ValidateNetdiskBody(content); !errors.Is(err, ErrBadQuotaMB) {
 			t.Fatalf("mb=%d must be rejected at validation, got %v", mb, err)
 		}
 	}
 	// 非 canonical / 夹带多余字段 / 畸形 JSON 全部拒绝。
-	if _, err := ValidateNetdiskContent([]byte(`{ "mb" : 5 }`)); !errors.Is(err, ErrBadQuotaMB) {
-		t.Fatalf("non-canonical content must be rejected, got %v", err)
+	if _, err := ValidateNetdiskBody([]byte(`{"netdisk":{ "mb" : 5 }}`)); !errors.Is(err, ErrBadQuotaMB) {
+		t.Fatalf("non-canonical body must be rejected, got %v", err)
 	}
-	if _, err := ValidateNetdiskContent([]byte(`{"kind":"netdisk_config","mb":5}`)); !errors.Is(err, ErrBadQuotaMB) {
+	if _, err := ValidateNetdiskBody([]byte(`{"netdisk":{"kind":"netdisk_config","mb":5}}`)); !errors.Is(err, ErrBadQuotaMB) {
 		t.Fatalf("extra field must be rejected, got %v", err)
 	}
-	if _, err := ValidateNetdiskContent([]byte(`not json`)); !errors.Is(err, ErrBadQuotaMB) {
+	// 判别位写错名字（配额塞进别的消息名下）也要拒。
+	if _, err := ValidateNetdiskBody([]byte(`{"text":{"mb":5}}`)); !errors.Is(err, ErrBadQuotaMB) {
+		t.Fatalf("wrong tag must be rejected, got %v", err)
+	}
+	if _, err := ValidateNetdiskBody([]byte(`not json`)); !errors.Is(err, ErrBadQuotaMB) {
 		t.Fatalf("garbage must be rejected, got %v", err)
 	}
 }
@@ -60,8 +63,8 @@ func TestManifestMessageRoundTrip(t *testing.T) {
 	mustOK(t, err)
 	msg, err := mgrs[0].ManifestMessage(mf)
 	mustOK(t, err)
-	if msg.Type != core.TypeHide || msg.GroupID != gid {
-		t.Fatal("message envelope wrong")
+	if name, err := core.CheckBody(msg.Kind, msg.Body); err != nil || name != core.NameManifest || msg.GroupID != gid {
+		t.Fatalf("message envelope wrong: kind=%q name=%q err=%v", msg.Kind, name, err)
 	}
 	got, sender, err := ManifestFromMessage(msg, gid)
 	mustOK(t, err)
@@ -77,10 +80,16 @@ func TestManifestMessageRoundTrip(t *testing.T) {
 	}
 	// 篡改内容 → 验签/复验必失败。
 	bad := msg
-	bad.Content = append([]byte(nil), msg.Content...)
-	bad.Content[len(bad.Content)/2] ^= 0x01
+	bad.Body = append([]byte(nil), msg.Body...)
+	bad.Body[len(bad.Body)/2] ^= 0x01
 	if _, _, err := ManifestFromMessage(bad, gid); err == nil {
 		t.Fatal("tampered message must fail")
+	}
+	// 大类谎报（把 ext/manifest 标成 cmd）→ kind↔name 互校必拦。
+	lied := msg
+	lied.Kind = core.KindCommand
+	if _, _, err := ManifestFromMessage(lied, gid); err == nil {
+		t.Fatal("kind mismatch must fail")
 	}
 	// 解出的清单可直接下载。
 	content2, err := mgrs[2].Download(got)

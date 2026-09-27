@@ -71,7 +71,7 @@ const (
 	ReasonOverreach   RejectReason = "event_not_permitted" // 越权事件（层级/自签规则不满足）
 	ReasonBadEvent    RejectReason = "event_rejected"      // ApplyEvent 的其他失败
 	ReasonHideSelf    RejectReason = "hide_invalid"        // hide 规则不满足（目标异主 / hide 被 hide）
-	ReasonUnknownType RejectReason = "unknown_type"
+	ReasonUnknownName RejectReason = "unknown_name"        // body 名不在注册表 / 与 kind 不符
 )
 
 // Outcome 是一次 Ingest/Publish 的结果。
@@ -208,11 +208,14 @@ func (e *Engine) process(from core.PubKey, raw []byte, m *core.Message) Outcome 
 		}
 		return e.reject(m, from, reason, err)
 	}
+	// body 名先行解析，仅供下面的 transfer 提案判定使用；kind↔name 交叉校验
+	// 留在第 4 步路由之前做，保证去重登记与差评的时机与 v25 完全一致。
+	name, _ := core.BodyName(m.Body)
 	// 1.5 v17① transfer 联署提案（定向 to=新 owner、EndorseSig 为空）：
 	//     必须先去重登记之前截获——提案与联署完成后的生效事件共享 msg_id
 	//     （联署绑定原文含 MsgID），若让提案进主 dedup，生效事件会被各节点
 	//     当重复包吞掉，移交永远无法生效。
-	if m.Type == core.TypeTransfer && m.To != nil && len(m.EndorseSig) == 0 {
+	if name == core.NameTransfer && m.To != nil && len(m.EndorseSig) == 0 {
 		return e.handleTransferProposal(m, raw, from)
 	}
 	// 2. 去重（验签后才记录，防止攻击者用伪造 msg_id 投毒缓存）：
@@ -232,18 +235,23 @@ func (e *Engine) process(from core.PubKey, raw []byte, m *core.Message) Outcome 
 		}
 		return e.reject(m, from, ReasonBlacklisted, fmt.Errorf("%w: sender %s is blacklisted", core.ErrNotPermitted, m.Sender))
 	}
-	// 4. 按类型路由。
-	switch {
-	case m.Type == core.TypeJoinReq:
+	// 4. 按具体消息名路由。kind↔name 交叉校验在此复检：把名单命令伪装成 msg
+	//    （想绕过名单权限检查）在受理前即被挡下并差评。
+	if _, err := core.CheckBody(m.Kind, m.Body); err != nil {
+		return e.reject(m, from, ReasonUnknownName, err)
+	}
+	switch name {
+	case core.NameJoinReq:
 		return e.handleJoinReq(m, raw, from)
-	case m.Type == core.TypeHide:
+	case core.NameHide:
 		return e.handleHide(m, raw, from)
-	case m.Type == core.TypeText:
+	case core.NameText:
 		return e.handleText(m, raw, from)
-	case IsRosterEvent(m.Type):
-		return e.handleRosterEvent(m, raw, from)
 	default:
-		return e.reject(m, from, ReasonUnknownType, fmt.Errorf("%w: type %q", core.ErrMalformed, m.Type))
+		if IsRosterEvent(name) {
+			return e.handleRosterEvent(m, raw, from)
+		}
+		return e.reject(m, from, ReasonUnknownName, fmt.Errorf("%w: name %q", core.ErrMalformed, name))
 	}
 }
 
@@ -263,7 +271,7 @@ func (e *Engine) handleText(m *core.Message, raw []byte, from core.PubKey) Outco
 		if h := e.Handlers.Chat; h != nil {
 			h(*m)
 		}
-		e.flushPendingHides(m.MsgID, m.Type, m.Sender)
+		e.flushPendingHides(m)
 	}
 	n := e.flood(raw, m, from)
 	return Outcome{Accepted: true, Delivered: !directed, Flooded: n, Kind: KindChat}
@@ -286,7 +294,7 @@ func (e *Engine) handleRosterEvent(m *core.Message, raw []byte, from core.PubKey
 	if h := e.Handlers.RosterEvent; h != nil {
 		h(*m)
 	}
-	e.flushPendingHides(m.MsgID, m.Type, m.Sender)
+	e.flushPendingHides(m)
 	n := e.flood(raw, m, from)
 	return Outcome{Accepted: true, Delivered: true, Flooded: n, Kind: KindRosterEvent}
 }
@@ -353,7 +361,7 @@ func (e *Engine) handleTransferProposal(m *core.Message, raw []byte, from core.P
 // handleHide：target 必须与原消息同 pubkey；hide 不可被 hide；本机软删除 + flood。
 // 目标未达时先挂起（pendingHide），目标到达时再校验执行——乱序不丢 hide。
 func (e *Engine) handleHide(m *core.Message, raw []byte, from core.PubKey) Outcome {
-	hc, err := DecodeHideContent(m.Content)
+	hc, err := DecodeHideBody(m.Body)
 	if err != nil {
 		return e.reject(m, from, ReasonMalformed, err)
 	}
@@ -361,7 +369,7 @@ func (e *Engine) handleHide(m *core.Message, raw []byte, from core.PubKey) Outco
 		return e.reject(m, from, ReasonHideSelf, fmt.Errorf("%w: hide targets itself", core.ErrMalformed))
 	}
 	if tgt, ok := e.lookupTarget(hc.TargetMsgID); ok {
-		if tgt.Type == core.TypeHide {
+		if name, _ := core.BodyName(tgt.Body); name == core.NameHide {
 			return e.reject(m, from, ReasonHideSelf, fmt.Errorf("%w: hide cannot target a hide", core.ErrNotPermitted))
 		}
 		if !tgt.Sender.Equal(m.Sender) {
@@ -413,8 +421,8 @@ func (e *Engine) PublishProposal(m core.Message) (int, error) {
 	if m.GroupID != e.GroupID {
 		return 0, fmt.Errorf("%w: group_id mismatch on publish", core.ErrMalformed)
 	}
-	if m.Type != core.TypeTransfer || m.To == nil || len(m.EndorseSig) != 0 {
-		return 0, fmt.Errorf("%w: not a transfer proposal (need type=transfer, to set, empty endorse_sig)", core.ErrMalformed)
+	if name, err := core.CheckBody(m.Kind, m.Body); err != nil || name != core.NameTransfer || m.To == nil || len(m.EndorseSig) != 0 {
+		return 0, fmt.Errorf("%w: not a transfer proposal (need cmd/transfer, to set, empty endorse_sig)", core.ErrMalformed)
 	}
 	if err := VerifyMessage(m); err != nil {
 		return 0, err
@@ -517,12 +525,13 @@ func (e *Engine) effectivePendingTTL() time.Duration {
 
 // flushPendingHides 在目标消息到达时兑现挂起的 hide（仍守 hide 规则：
 // hide 不可被 hide、目标须同 pubkey）。
-func (e *Engine) flushPendingHides(msgID, msgType string, sender core.PubKey) {
-	for _, ph := range e.pending.takeFor(msgID) {
-		if msgType == core.TypeHide || !ph.sender.Equal(sender) {
+func (e *Engine) flushPendingHides(m *core.Message) {
+	name, _ := core.BodyName(m.Body)
+	for _, ph := range e.pending.takeFor(m.MsgID) {
+		if name == core.NameHide || !ph.sender.Equal(m.Sender) {
 			continue
 		}
-		e.softDelete(msgID)
+		e.softDelete(m.MsgID)
 		break
 	}
 }

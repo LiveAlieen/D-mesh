@@ -57,27 +57,27 @@ func (n *node) Hide(msgID string) error {
 
 // Leave 本人自签 remove 退群（v15：不进黑名单，随时可再被拉入）。
 func (n *node) Leave() error {
-	return n.signAndPublish(core.TypeRemove, targetContent{Target: n.self}, n.now())
+	return n.signAndPublish(core.NameRemove, targetContent{Target: n.self}, n.now())
 }
 
 func (n *node) Kick(target core.PubKey) error {
-	return n.signAndPublish(core.TypeKick, targetContent{Target: target}, n.now())
+	return n.signAndPublish(core.NameKick, targetContent{Target: target}, n.now())
 }
 
 func (n *node) Unban(target core.PubKey) error {
-	return n.signAndPublish(core.TypeUnban, targetContent{Target: target}, n.now())
+	return n.signAndPublish(core.NameUnban, targetContent{Target: target}, n.now())
 }
 
 func (n *node) SetPerms(target core.PubKey, perms []string) error {
-	return n.signAndPublish(core.TypePerms, permsContent{Target: target, Perms: perms}, n.now())
+	return n.signAndPublish(core.NamePerms, permsContent{Target: target, Perms: perms}, n.now())
 }
 
 func (n *node) GrantAdmin(target core.PubKey) error {
-	return n.signAndPublish(core.TypeGrantAdmin, targetContent{Target: target}, n.now())
+	return n.signAndPublish(core.NameGrantAdmin, targetContent{Target: target}, n.now())
 }
 
 func (n *node) RevokeAdmin(target core.PubKey) error {
-	return n.signAndPublish(core.TypeRevokeAdmin, targetContent{Target: target}, n.now())
+	return n.signAndPublish(core.NameRevokeAdmin, targetContent{Target: target}, n.now())
 }
 
 // Transfer v17①：现任群主（或创建者）发起移交。本机签好 transfer 原文
@@ -91,12 +91,12 @@ func (n *node) Transfer(newOwner core.PubKey) error {
 	if !n.roster.HasPerm(n.self, core.PermTransfer) {
 		return fmt.Errorf("%w: 本机不持 transfer 权限", core.ErrNotPermitted)
 	}
-	cb, err := group.EncodeEventContent(transferContent{NewOwner: newOwner})
+	cb, err := group.EncodeEventBody(core.NameTransfer, transferContent{NewOwner: newOwner})
 	if err != nil {
 		return err
 	}
 	to := newOwner
-	m := core.Message{Type: core.TypeTransfer, Content: cb, TSms: n.now(), To: &to}
+	m := core.Message{Kind: core.KindCommand, Body: cb, TSms: n.now(), To: &to}
 	if err := group.SignEvent(&m, n.id, n.gid); err != nil {
 		return err
 	}

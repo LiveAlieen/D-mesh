@@ -115,22 +115,9 @@ const (
 // 「距最后一次发消息超过该毫秒数」即视为离线（v13.1）。
 const DefaultOfflineAfterMS int64 = 5 * 60 * 1000
 
-// 消息 / 名单事件类型常量。除 TypeText/TypeHide 外均为名单事件，聊天流不显示。
-const (
-	TypeText        = "text"
-	TypeHide        = "hide"
-	TypeJoinReq     = "join_req"
-	TypeJoin        = "join"
-	TypeRemove      = "remove"
-	TypeKick        = "kick"
-	TypeUnban       = "unban"
-	TypePerms       = "perms"
-	TypeGrantAdmin  = "grant_admin"
-	TypeRevokeAdmin = "revoke_admin"
-	TypeTransfer    = "transfer"
-	TypePresence    = "presence"
-	TypeNetdisk     = "netdisk"
-)
+// 消息 / 名单事件 / 扩展载荷的三位判别与正文名字集中在 body.go（v26 消息归一化）。
+// 旧的 13 个平铺 Type 常量已随信封改造退役：类型位只剩 kind（msg/cmd/ext），
+// 具体名字改由 body 的唯一键承载。
 
 // Proof 是名单事件的「原文 + 签名」，任意节点可独立复验（无需信任转发者）。
 // Raw 为被签名事件的 CanonicalJSON 原文（见 ProofOf）。
@@ -176,16 +163,21 @@ func (p PresenceEntry) Online(now int64) bool {
 	return now-p.LastMsgTS < thr
 }
 
-// Message 是唯一的传输单元：聊天消息与名单事件同构、同路（gossip flood）。
-// Sig 的签名原文 = MessageSigPayload(m)（本包提供，含 GroupID 以绑定群与签名域）。
+// Message 是唯一的传输单元：聊天消息、管理命令与协议扩展同构同路（gossip flood）。
+// 信封即用户定稿的三段式——时间（TSms）+ 具体消息（Kind 三位判别 + Body 载荷）+
+// 签名（Sig）。签名原文 = MessageSigPayload(m)（本包提供，含 GroupID 以绑定群与签名域）。
 // To 非空表示定向消息（如被拉黑者发给解禁权限者的申诉）。
+//
+// v26 起没有独立的 type 字段：Kind ∈ msg/cmd/ext 定大类，Body 是恰含一个键的
+// tagged union `{"<名字>": <载荷>}`，那个键就是具体消息/命令/扩展的名字；
+// 两者必须互校（core.CheckBody）。详见 body.go。
 type Message struct {
 	MsgID      string   `json:"msg_id"`
 	GroupID    [32]byte `json:"group_id"`
 	Sender     PubKey   `json:"sender"`
 	TSms       int64    `json:"ts_ms"`
-	Type       string   `json:"type"`
-	Content    []byte   `json:"content"`
+	Kind       string   `json:"kind"`
+	Body       []byte   `json:"body"`
 	To         *PubKey  `json:"to,omitempty"`
 	Alg        SigAlg   `json:"sig_alg"`
 	Sig        []byte   `json:"sig,omitempty"`

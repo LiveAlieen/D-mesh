@@ -33,7 +33,7 @@ func TestDropMemberLocalClean(t *testing.T) {
 	base := e.now - 40_000
 	join := e.joinAs(e.creat, alice.Pub(), base, mkWG(30))
 	e.mustApply(join)
-	e.mustApply(e.ev(alice, core.TypePresence,
+	e.mustApply(e.ev(alice, core.NamePresence,
 		eventPresence{Pub: alice.Pub(), LastMsgTS: base + 1, OfflineAfter: 60_000}, base+1))
 
 	var notes []RosterEvent
@@ -88,7 +88,7 @@ func TestDropMemberAnchorRefusals(t *testing.T) {
 	}
 
 	// 当前 owner 指针持有的条目拒绝清洗。
-	m := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: admin.Pub()}, ts)
+	m := e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: admin.Pub()}, ts)
 	if err := EndorseEvent(&m, admin); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestDropMemberAnchorRefusals(t *testing.T) {
 	// 指针经 transfer 移走并降为管理后，前群主条目可正常清洗。
 	carol := mkSigner(t, 45)
 	e.mustApply(e.joinAs(e.creat, carol.Pub(), ts+1, mkWG(45)))
-	m2 := e.ev(e.creat, core.TypeTransfer, eventTransfer{NewOwner: carol.Pub()}, ts+2)
+	m2 := e.ev(e.creat, core.NameTransfer, eventTransfer{NewOwner: carol.Pub()}, ts+2)
 	if err := EndorseEvent(&m2, carol); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestDropBanReacceptsKick(t *testing.T) {
 	base := e.now - 40_000
 	bob := mkSigner(t, 33)
 	e.mustApply(e.joinAs(e.creat, bob.Pub(), base, mkWG(33)))
-	kick := e.ev(e.creat, core.TypeKick, eventTarget{Target: bob.Pub()}, base+1)
+	kick := e.ev(e.creat, core.NameKick, eventTarget{Target: bob.Pub()}, base+1)
 	e.mustApply(kick)
 	if !e.r.IsBlacklisted(bob.Pub()) {
 		t.Fatal("bob should be blacklisted")

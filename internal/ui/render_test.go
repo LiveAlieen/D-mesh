@@ -179,7 +179,7 @@ func TestFormatChatLine(t *testing.T) {
 	d := mustPub(t, "2222222222222222222222222222222222222222222222222222222222222222")
 	m := core.Message{
 		Sender: s, TSms: time.Unix(1700000000, 0).UnixMilli(),
-		Type: core.TypeText, Content: []byte("hi there"),
+		Kind: core.KindMessage, Body: []byte(`{"text":"hi there"}`),
 	}
 	line := FormatChatLine(m)
 	if !strings.Contains(line, "ed25519:11111111") || !strings.HasSuffix(line, "hi there") {
@@ -190,9 +190,10 @@ func TestFormatChatLine(t *testing.T) {
 	if !strings.Contains(line, "→ed25519:22222222") {
 		t.Errorf("directed line = %q", line)
 	}
-	m.Type = core.TypeHide
-	if !strings.Contains(FormatChatLine(m), "(hide) hi there") {
-		t.Errorf("non-text prefix missing: %q", FormatChatLine(m))
+	m.Kind = core.KindCommand
+	m.Body = []byte(`{"hide":{"target_msg_id":"abc"}}`)
+	if line = FormatChatLine(m); !strings.Contains(line, `(hide) {"hide":{"target_msg_id":"abc"}}`) {
+		t.Errorf("non-chat line must carry the name tag + body: %q", line)
 	}
 }
 

@@ -155,9 +155,11 @@ func (r *Roster) shouldHold(m core.Message) bool {
 	if m.TSms <= r.watermark {
 		return false // 迟到（宽限内）按当前状态直接应用
 	}
-	switch m.Type {
-	case core.TypePresence, core.TypeJoinReq:
-		return false
+	if name, err := core.BodyName(m.Body); err == nil {
+		switch name {
+		case core.NamePresence, core.NameJoinReq:
+			return false
+		}
 	}
 	return true
 }
@@ -218,23 +220,30 @@ func (r *Roster) prepareEvent(m core.Message, drained bool) ([]RosterEvent, erro
 	if m.MsgID == "" {
 		return nil, fmt.Errorf("%w: empty msg_id", core.ErrMalformed)
 	}
-	// transfer 是唯一可带 to 的名单事件（v17①：提案定向发给新 owner，
-	// 新 owner 的联署原文含 to，故生效事件仍带 to=新 owner）；其余名单
-	// 事件必须广播（to=nil）。
-	if m.To != nil && m.Type != core.TypeTransfer {
-		return nil, fmt.Errorf("%w: roster events must be broadcast (to must be nil)", core.ErrMalformed)
+	// v26 归一化：信封只有 kind + body，事件名取自 body 的唯一键并与 kind 互校。
+	// 判别位住在 body 里、可被篡改，这里只「尽力解析」：解析失败不在本步报错，
+	// 而是留到验签之后（3.5），使「正文被动过」依旧优先报 invalid signature，
+	// 与 v25 的判序一致。
+	name, nameErr := core.CheckBody(m.Kind, m.Body)
+	if nameErr == nil {
+		// transfer 是唯一可带 to 的名单事件（v17①：提案定向发给新 owner，
+		// 新 owner 的联署原文含 to，故生效事件仍带 to=新 owner）；其余名单
+		// 事件必须广播（to=nil）。
+		if m.To != nil && name != core.NameTransfer {
+			return nil, fmt.Errorf("%w: roster events must be broadcast (to must be nil)", core.ErrMalformed)
+		}
+		switch name {
+		case core.NameJoinReq, core.NameJoin, core.NameRemove, core.NameKick, core.NameUnban,
+			core.NamePerms, core.NameGrantAdmin, core.NameRevokeAdmin, core.NameTransfer,
+			core.NamePresence, core.NameNetdisk:
+		case core.NameText, core.NameHide, core.NameManifest:
+			return nil, fmt.Errorf("%w: %q is not a roster event", core.ErrMalformed, name)
+		default:
+			return nil, fmt.Errorf("%w: unknown event name %q", core.ErrMalformed, name)
+		}
 	}
 	if m.TSms < 0 {
 		return nil, fmt.Errorf("%w: negative ts_ms", core.ErrMalformed)
-	}
-	switch m.Type {
-	case core.TypeJoinReq, core.TypeJoin, core.TypeRemove, core.TypeKick, core.TypeUnban,
-		core.TypePerms, core.TypeGrantAdmin, core.TypeRevokeAdmin, core.TypeTransfer,
-		core.TypePresence, core.TypeNetdisk:
-	case core.TypeText, core.TypeHide:
-		return nil, fmt.Errorf("%w: %q is not a roster event", core.ErrMalformed, m.Type)
-	default:
-		return nil, fmt.Errorf("%w: unknown event type %q", core.ErrMalformed, m.Type)
 	}
 	// 2. 群绑定：种子已知时事件 group_id 必须一致。
 	if r.haveCfg && r.groupID != m.GroupID {
@@ -247,6 +256,10 @@ func (r *Roster) prepareEvent(m core.Message, drained bool) ([]RosterEvent, erro
 	}
 	if err := verifyMessageSig(m.Sender, m.Alg, payload, m.Sig); err != nil {
 		return nil, err
+	}
+	// 3.5 验签通过后才对判别位下权威结论（kind↔name 互校）。
+	if nameErr != nil {
+		return nil, nameErr
 	}
 	if !drained {
 		// 4. 时间窗。
@@ -268,45 +281,45 @@ func (r *Roster) prepareEvent(m core.Message, drained bool) ([]RosterEvent, erro
 		return nil, fmt.Errorf("%w: sender is blacklisted", core.ErrNotPermitted)
 	}
 	// 7. 签名者必须已是成员（join_req 例外：申请人尚非成员，自签仅受理中继）。
-	if m.Type != core.TypeJoinReq && r.tierOf(m.Sender) < 0 {
+	if name != core.NameJoinReq && r.tierOf(m.Sender) < 0 {
 		return nil, fmt.Errorf("%w: sender is not a member", core.ErrNotPermitted)
 	}
-	return r.dispatch(m, payload)
+	return r.dispatch(m, name, payload)
 }
 
-// dispatch 按事件类型做层级/权限/自签校验并产出计划。
-func (r *Roster) dispatch(m core.Message, payload []byte) ([]RosterEvent, error) {
-	switch m.Type {
-	case core.TypeJoinReq:
+// dispatch 按事件名（body 的唯一键）做层级/权限/自签校验并产出计划。
+func (r *Roster) dispatch(m core.Message, name string, sigPayload []byte) ([]RosterEvent, error) {
+	switch name {
+	case core.NameJoinReq:
 		return r.evJoinReq(m)
-	case core.TypeJoin:
+	case core.NameJoin:
 		return r.evJoin(m)
-	case core.TypeRemove:
+	case core.NameRemove:
 		return r.evRemove(m)
-	case core.TypeKick:
+	case core.NameKick:
 		return r.evKick(m)
-	case core.TypeUnban:
+	case core.NameUnban:
 		return r.evUnban(m)
-	case core.TypePerms:
+	case core.NamePerms:
 		return r.evPerms(m)
-	case core.TypeGrantAdmin:
-		return r.evGrantRevoke(m, true)
-	case core.TypeRevokeAdmin:
-		return r.evGrantRevoke(m, false)
-	case core.TypeTransfer:
-		return r.evTransfer(m, payload)
-	case core.TypePresence:
+	case core.NameGrantAdmin:
+		return r.evGrantRevoke(m, true, name)
+	case core.NameRevokeAdmin:
+		return r.evGrantRevoke(m, false, name)
+	case core.NameTransfer:
+		return r.evTransfer(m, sigPayload)
+	case core.NamePresence:
 		return r.evPresence(m)
-	case core.TypeNetdisk:
+	case core.NameNetdisk:
 		return r.evNetdisk(m)
 	}
-	return nil, fmt.Errorf("%w: unreachable event type", core.ErrMalformed)
+	return nil, fmt.Errorf("%w: unreachable event name %q", core.ErrMalformed, name)
 }
 
 // evJoinReq：新人自签申请。不改名单，只进收件箱供具 carry 权限者处理。
 func (r *Roster) evJoinReq(m core.Message) ([]RosterEvent, error) {
 	var c eventJoinReq
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameJoinReq, &c); err != nil {
 		return nil, err
 	}
 	if !pubMatches(c.Pub, m.Sender) {
@@ -331,7 +344,7 @@ func (r *Roster) evJoinReq(m core.Message) ([]RosterEvent, error) {
 // 注意：content.pub 是「目标新人」，签名者是 m.Sender（拉人者），二者必须不同。
 func (r *Roster) evJoin(m core.Message) ([]RosterEvent, error) {
 	var c eventJoin
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameJoin, &c); err != nil {
 		return nil, err
 	}
 	target := c.Pub
@@ -386,7 +399,7 @@ func (r *Roster) evJoin(m core.Message) ([]RosterEvent, error) {
 // 绝不升级为除名。
 func (r *Roster) evRemove(m core.Message) ([]RosterEvent, error) {
 	var c eventTarget
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameRemove, &c); err != nil {
 		return nil, err
 	}
 	if !c.Target.Equal(m.Sender) {
@@ -405,7 +418,7 @@ func (r *Roster) evRemove(m core.Message) ([]RosterEvent, error) {
 // 目标层级须严格低于签名者（创建者不可被除名；除名群主仅创建者可为）。
 func (r *Roster) evKick(m core.Message) ([]RosterEvent, error) {
 	var c eventTarget
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameKick, &c); err != nil {
 		return nil, err
 	}
 	if c.Target.Equal(m.Sender) {
@@ -436,7 +449,7 @@ func (r *Roster) evKick(m core.Message) ([]RosterEvent, error) {
 // 目标移出黑名单。目标不在黑名单时视为无效事件。
 func (r *Roster) evUnban(m core.Message) ([]RosterEvent, error) {
 	var c eventTarget
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameUnban, &c); err != nil {
 		return nil, err
 	}
 	e, ok := r.members[m.Sender.Key()]
@@ -453,7 +466,7 @@ func (r *Roster) evUnban(m core.Message) ([]RosterEvent, error) {
 // 层级达群主且本人持有该位的签发者赋予（授权不超出签发者自身）。
 func (r *Roster) evPerms(m core.Message) ([]RosterEvent, error) {
 	var c eventPerms
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NamePerms, &c); err != nil {
 		return nil, err
 	}
 	tgt, ok := r.members[c.Target.Key()]
@@ -484,15 +497,12 @@ func (r *Roster) evPerms(m core.Message) ([]RosterEvent, error) {
 }
 
 // evGrantRevoke：任命/收放管理权——仅群主/创建者可签，且目标层级严格更低。
-func (r *Roster) evGrantRevoke(m core.Message, grant bool) ([]RosterEvent, error) {
+func (r *Roster) evGrantRevoke(m core.Message, grant bool, name string) ([]RosterEvent, error) {
 	var c eventTarget
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, name, &c); err != nil {
 		return nil, err
 	}
-	verb := core.TypeRevokeAdmin
-	if grant {
-		verb = core.TypeGrantAdmin
-	}
+	verb := name // 错误消息里带上具体命令名（grant_admin / revoke_admin）
 	if r.tierOf(m.Sender) < core.TierOwner {
 		return nil, fmt.Errorf("%w: only owner/creator can sign %s", core.ErrNotPermitted, verb)
 	}
@@ -525,7 +535,7 @@ func (r *Roster) evGrantRevoke(m core.Message, grant bool) ([]RosterEvent, error
 // 各节点在此一并校验 to 与 new_owner 一致，防止借定向通道夹带任意目标。
 func (r *Roster) evTransfer(m core.Message, payload []byte) ([]RosterEvent, error) {
 	var c eventTransfer
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameTransfer, &c); err != nil {
 		return nil, err
 	}
 	newOwner := c.NewOwner
@@ -612,7 +622,7 @@ func (r *Roster) demoteCandidatesLocked(newOwner, sender core.PubKey) []core.Pub
 // 不参与权限判定。
 func (r *Roster) evPresence(m core.Message) ([]RosterEvent, error) {
 	var c eventPresence
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NamePresence, &c); err != nil {
 		return nil, err
 	}
 	if !pubMatches(c.Pub, m.Sender) {
@@ -635,7 +645,7 @@ func (r *Roster) evPresence(m core.Message) ([]RosterEvent, error) {
 // evNetdisk：群主/创建者改全局配额；越界（0~256 之外）直接拒绝。
 func (r *Roster) evNetdisk(m core.Message) ([]RosterEvent, error) {
 	var c eventNetdisk
-	if err := decodeEventContent(m.Content, &c); err != nil {
+	if err := decodeEventBody(m, core.NameNetdisk, &c); err != nil {
 		return nil, err
 	}
 	if !core.ValidNetdiskMB(c.MB) {

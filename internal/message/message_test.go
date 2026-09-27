@@ -9,44 +9,66 @@ import (
 	"dmesh/internal/core"
 )
 
-func TestTypeClassification(t *testing.T) {
+// TestBodyClassification 是 v26 归一化的分类真值表：每个具体消息名落在哪个大类、
+// 是否进气泡流、是否走名单校验，全部钉死；并强制「注册表里不得有本表未覆盖的名字」
+// （加一类消息/命令/扩展却忘了来这里登记，测试直接红）。
+func TestBodyClassification(t *testing.T) {
 	cases := []struct {
-		typ    string
+		name   string
+		kind   string
 		chat   bool
 		roster bool
-		known  bool
 	}{
-		{core.TypeText, true, false, true},
-		{core.TypeHide, false, false, true},
-		{core.TypeJoinReq, false, false, true},
-		{core.TypeJoin, false, true, true},
-		{core.TypeRemove, false, true, true},
-		{core.TypeKick, false, true, true},
-		{core.TypeUnban, false, true, true},
-		{core.TypePerms, false, true, true},
-		{core.TypeGrantAdmin, false, true, true},
-		{core.TypeRevokeAdmin, false, true, true},
-		{core.TypeTransfer, false, true, true},
-		{core.TypePresence, false, true, true},
-		{core.TypeNetdisk, false, true, true},
-		{"bogus", false, false, false},
+		{core.NameText, core.KindMessage, true, false},
+		{core.NameHide, core.KindCommand, false, false},
+		{core.NameJoinReq, core.KindCommand, false, false},
+		{core.NameJoin, core.KindCommand, false, true},
+		{core.NameRemove, core.KindCommand, false, true},
+		{core.NameKick, core.KindCommand, false, true},
+		{core.NameUnban, core.KindCommand, false, true},
+		{core.NamePerms, core.KindCommand, false, true},
+		{core.NameGrantAdmin, core.KindCommand, false, true},
+		{core.NameRevokeAdmin, core.KindCommand, false, true},
+		{core.NameTransfer, core.KindCommand, false, true},
+		{core.NameNetdisk, core.KindCommand, false, true},
+		{core.NamePresence, core.KindExtension, false, true},
+		{core.NameManifest, core.KindExtension, false, false},
 	}
+	covered := map[string]bool{}
 	for _, tc := range cases {
-		if got := VisibleInChat(tc.typ); got != tc.chat {
-			t.Errorf("VisibleInChat(%q)=%v want %v", tc.typ, got, tc.chat)
+		covered[tc.name] = true
+		if got, _ := core.KindOf(tc.name); got != tc.kind {
+			t.Errorf("KindOf(%q)=%q want %q", tc.name, got, tc.kind)
 		}
-		if got := IsRosterEvent(tc.typ); got != tc.roster {
-			t.Errorf("IsRosterEvent(%q)=%v want %v", tc.typ, got, tc.roster)
+		if got := VisibleInChat(tc.kind); got != tc.chat {
+			t.Errorf("VisibleInChat(%q)=%v want %v", tc.kind, got, tc.chat)
 		}
-		if got := IsKnownType(tc.typ); got != tc.known {
-			t.Errorf("IsKnownType(%q)=%v want %v", tc.typ, got, tc.known)
+		if got := IsRosterEvent(tc.name); got != tc.roster {
+			t.Errorf("IsRosterEvent(%q)=%v want %v", tc.name, got, tc.roster)
+		}
+		if !IsKnownName(tc.name) {
+			t.Errorf("IsKnownName(%q)=false", tc.name)
+		}
+	}
+	for _, n := range core.Names() {
+		if !covered[n] {
+			t.Errorf("注册表新增 %q 未登记进分类真值表", n)
+		}
+	}
+	for _, bogus := range []string{"bogus", "", "text "} {
+		if IsKnownName(bogus) || core.IsKnownName(bogus) || IsRosterEvent(bogus) {
+			t.Errorf("unknown name %q must not be recognised", bogus)
 		}
 	}
 }
 
 func TestNewMessageDeterministicPayloadAndVerify(t *testing.T) {
 	s := newTestSigner()
-	m := core.Message{Type: core.TypeText, TSms: 1700000000123, Content: []byte("你好 D-Mesh"), MsgID: "fixed-id"}
+	tb, err := core.TextBody("你好 D-Mesh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := core.Message{Kind: core.KindMessage, TSms: 1700000000123, Body: tb, MsgID: "fixed-id"}
 	signed, err := NewMessage(s, testGroupID, &m, nil)
 	if err != nil {
 		t.Fatalf("NewMessage: %v", err)
@@ -62,7 +84,8 @@ func TestNewMessageDeterministicPayloadAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SigPayloadOf: %v", err)
 	}
-	if !bytes.HasPrefix(payload, []byte(`{"content":"`)) {
+	// CanonicalJSON 键按字典序，正文体排在最前（v26 归一化后 body 是首键）。
+	if !bytes.HasPrefix(payload, []byte(`{"body":"`)) {
 		t.Fatalf("payload not canonical (key order/whitespace wrong): %s", payload)
 	}
 	if !jsonValidCanonical(payload) {
@@ -89,7 +112,7 @@ func TestVerifyMessageRejections(t *testing.T) {
 	base := mustText(t, s, 1700000000000, "hello", "id-1")
 
 	tampered := base
-	tampered.Content = []byte("hello!")
+	tampered.Body = []byte(`{"text":"hello!"}`)
 	if err := VerifyMessage(tampered); !errors.Is(err, core.ErrInvalidSig) {
 		t.Fatalf("tampered content: want ErrInvalidSig, got %v", err)
 	}
@@ -125,7 +148,7 @@ func TestFrameEncodeDecodeRoundTrip(t *testing.T) {
 		t.Fatalf("DecodeFrame: %v", err)
 	}
 	if got.MsgID != m.MsgID || got.GroupID != m.GroupID || !got.Sender.Equal(m.Sender) ||
-		got.Type != m.Type || !bytes.Equal(got.Content, m.Content) || !bytes.Equal(got.Sig, m.Sig) {
+		got.Kind != m.Kind || !bytes.Equal(got.Body, m.Body) || !bytes.Equal(got.Sig, m.Sig) {
 		t.Fatalf("round trip lost fields: %+v", got)
 	}
 	if got.MsgID == "" {
@@ -153,8 +176,14 @@ func TestDecodeFrameMalformedTable(t *testing.T) {
 	}{
 		{"empty", nil},
 		{"not json", []byte("{")},
-		{"no msg_id", []byte(`{"msg_id":"","group_id":[1],"type":"text"}`)},
-		{"unknown type", []byte(`{"msg_id":"a","group_id":[1],"type":"dance"}`)},
+		{"no msg_id", []byte(`{"msg_id":"","group_id":[1],"kind":"msg","body":{"text":"x"}}`)},
+		{"unknown name", []byte(`{"msg_id":"a","group_id":[1],"kind":"msg","body":{"dance":1}}`)},
+		// v26 判别位：kind 与 body 唯一键必须互校，body 必须恰一个键。
+		{"kind/name mismatch", []byte(`{"msg_id":"a","group_id":[1],"kind":"msg","body":{"kick":{"target":"x"}}}`)},
+		{"no kind declared", []byte(`{"msg_id":"a","group_id":[1],"kind":"","body":{"text":"x"}}`)},
+		{"body zero key", []byte(`{"msg_id":"a","group_id":[1],"kind":"msg","body":{}}`)},
+		{"body two keys", []byte(`{"msg_id":"a","group_id":[1],"kind":"msg","body":{"text":"x","hide":{"target_msg_id":"t"}}}`)},
+		{"body not object", []byte(`{"msg_id":"a","group_id":[1],"kind":"msg","body":"x"}`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,25 +204,29 @@ func TestDecodeFrameMalformedTable(t *testing.T) {
 }
 
 func TestHideContentCodec(t *testing.T) {
-	raw, err := EncodeHideContent("target-123")
+	raw, err := EncodeHideBody("target-123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != `{"target_msg_id":"target-123"}` {
-		t.Fatalf("hide content not canonical: %s", raw)
+	if string(raw) != `{"hide":{"target_msg_id":"target-123"}}` {
+		t.Fatalf("hide body not canonical: %s", raw)
 	}
-	hc, err := DecodeHideContent(raw)
+	hc, err := DecodeHideBody(raw)
 	if err != nil || hc.TargetMsgID != "target-123" {
 		t.Fatalf("decode: %v %+v", err, hc)
 	}
-	if _, err := EncodeHideContent(""); !errors.Is(err, core.ErrMalformed) {
+	if _, err := EncodeHideBody(""); !errors.Is(err, core.ErrMalformed) {
 		t.Fatalf("empty target: want ErrMalformed, got %v", err)
 	}
-	if _, err := DecodeHideContent([]byte(`{}`)); !errors.Is(err, core.ErrMalformed) {
+	if _, err := DecodeHideBody([]byte(`{}`)); !errors.Is(err, core.ErrMalformed) {
 		t.Fatalf("missing field: want ErrMalformed, got %v", err)
 	}
-	if _, err := DecodeHideContent([]byte(`[]`)); !errors.Is(err, core.ErrMalformed) {
+	if _, err := DecodeHideBody([]byte(`[]`)); !errors.Is(err, core.ErrMalformed) {
 		t.Fatalf("wrong shape: want ErrMalformed, got %v", err)
+	}
+	// 标签位写错名字（把 hide 包成 text）同样拒。
+	if _, err := DecodeHideBody([]byte(`{"text":{"target_msg_id":"t"}}`)); !errors.Is(err, core.ErrMalformed) {
+		t.Fatalf("wrong tag: want ErrMalformed, got %v", err)
 	}
 }
 
@@ -203,13 +236,13 @@ func TestNewHideBuildsValidMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hm.Type != core.TypeHide {
-		t.Fatalf("type %q", hm.Type)
+	if name, err := core.CheckBody(hm.Kind, hm.Body); err != nil || name != core.NameHide {
+		t.Fatalf("kind/name = %q/%q err=%v", hm.Kind, name, err)
 	}
 	if err := VerifyMessage(hm); err != nil {
 		t.Fatalf("hide verify: %v", err)
 	}
-	hc, err := DecodeHideContent(hm.Content)
+	hc, err := DecodeHideBody(hm.Body)
 	if err != nil || hc.TargetMsgID != "tgt-1" {
 		t.Fatalf("hide content: %v %+v", err, hc)
 	}

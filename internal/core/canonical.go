@@ -172,7 +172,7 @@ func MessageSigPayload(m Message) ([]byte, error) {
 // ProofOf 把一个已签名的名单事件消息打包成可独立复验的 Proof（存进名单条目）。
 func ProofOf(m Message) (Proof, error) {
 	if len(m.Sig) == 0 {
-		return Proof{}, fmt.Errorf("%w: event %q has no signature", ErrMalformed, m.Type)
+		return Proof{}, fmt.Errorf("%w: event %q/%q has no signature", ErrMalformed, m.Kind, m.Body)
 	}
 	raw, err := MessageSigPayload(m)
 	if err != nil {

@@ -20,35 +20,31 @@ var fallbackSeq atomic.Int64
 // ErrNoSignature 表示消息未签名即被送去验签（结构性错误，归入 ErrMalformed 语义）。
 var ErrNoSignature = fmt.Errorf("%w: message has no signature", core.ErrMalformed)
 
-// MaxContentBytes 是单条消息 content 的软上限（超出即拒收，防内存放大；
+// MaxBodyBytes 是单条消息 body 的软上限（超出即拒收，防内存放大；
 // 网盘块不经本结构承载，见 netdisk 包）。
-const MaxContentBytes = 1 << 20 // 1 MiB
+const MaxBodyBytes = 1 << 20 // 1 MiB
 
-// 消息类型分类（PLAN：名单事件与聊天同路广播，但聊天流只显示 text）。
+// 三类判别的分类口径（v26 消息归一化，PLAN 条目 19）：kind 定大类，
+// body 的唯一键定具体名字；聊天流只显示 msg，cmd/ext 一律不进气泡。
 
-// VisibleInChat 报告该类型是否出现在聊天流（仅 text；hide 与全部名单事件/presence 不显示）。
-func VisibleInChat(typ string) bool { return typ == core.TypeText }
+// VisibleInChat 报告该大类是否出现在聊天流（仅 KindMessage）。
+func VisibleInChat(kind string) bool { return kind == core.KindMessage }
 
-// IsRosterEvent 报告该类型是否为名单事件（经 core.Roster.ApplyEvent 验证并应用）。
-// 注意 join_req 不在此列：它不改名单、走无许可中继递送的特殊路径。
-func IsRosterEvent(typ string) bool {
-	switch typ {
-	case core.TypeJoin, core.TypeRemove, core.TypeKick, core.TypeUnban,
-		core.TypePerms, core.TypeGrantAdmin, core.TypeRevokeAdmin,
-		core.TypeTransfer, core.TypePresence, core.TypeNetdisk:
+// IsRosterEvent 报告该正文名字是否须经名单（core.Roster.ApplyEvent）验证并应用。
+// 注意 join_req 不在此列：它不改名单、走无许可中继递送的特殊路径；
+// presence 虽归 ext 大类，仍由名单侧的在场表应用（v13 分表）。
+func IsRosterEvent(name string) bool {
+	switch name {
+	case core.NameJoin, core.NameRemove, core.NameKick, core.NameUnban,
+		core.NamePerms, core.NameGrantAdmin, core.NameRevokeAdmin,
+		core.NameTransfer, core.NamePresence, core.NameNetdisk:
 		return true
 	}
 	return false
 }
 
-// IsKnownType 报告类型是否为协议已知值（未知类型一律拒收 + 差评）。
-func IsKnownType(typ string) bool {
-	switch typ {
-	case core.TypeText, core.TypeHide, core.TypeJoinReq:
-		return true
-	}
-	return IsRosterEvent(typ)
-}
+// IsKnownName 报告正文名字是否为协议已知值（未知一律拒收 + 差评）。
+func IsKnownName(name string) bool { return core.IsKnownName(name) }
 
 // MsgIDOf 生成 msg_id：优先取 sigPayload 的 sha256；若为空 payload 则随机 16 字节。
 // 调用方一般不必直接使用（NewMessage 会自动填充）。
@@ -86,6 +82,8 @@ func RandomMsgID() string {
 //     Sig = signer.Sign(原文)。
 //
 //  4. endorse 非空表示 transfer 类事件的新 owner 联署（它签的是同一份原文）。
+//
+// 出封面前先校 kind 与 body 唯一键互校（core.CheckBody），不匹配即拒绝签发。
 func NewMessage(signer core.Signer, groupID [32]byte, m *core.Message, endorse []byte) (core.Message, error) {
 	if signer == nil {
 		return core.Message{}, errors.New("message: nil signer")
@@ -99,8 +97,8 @@ func NewMessage(signer core.Signer, groupID [32]byte, m *core.Message, endorse [
 	out.Alg = signer.Alg()
 	out.Sig = nil
 	out.EndorseSig = endorse
-	if !IsKnownType(out.Type) {
-		return core.Message{}, fmt.Errorf("%w: unknown message type %q", core.ErrMalformed, out.Type)
+	if _, err := core.CheckBody(out.Kind, out.Body); err != nil {
+		return core.Message{}, err
 	}
 	if out.TSms <= 0 {
 		return core.Message{}, fmt.Errorf("%w: ts_ms must be positive", core.ErrMalformed)
@@ -153,13 +151,13 @@ func VerifyMessage(m core.Message) error {
 // core.MessageSigPayload 规范化重建，wire 编码本身不要求确定性）。
 func EncodeFrame(m core.Message) ([]byte, error) { return json.Marshal(m) }
 
-// DecodeFrame 解析一个传输帧并做结构校验（类型已知、group_id 非零、字段完整）。
-// 不做验签，也不查名单。
+// DecodeFrame 解析一个传输帧并做结构校验（kind 与 body 键互校通过、group_id
+// 非零、字段完整）。不做验签，也不查名单。
 func DecodeFrame(data []byte) (core.Message, error) {
 	if len(data) == 0 {
 		return core.Message{}, fmt.Errorf("%w: empty frame", core.ErrMalformed)
 	}
-	if len(data) > MaxContentBytes+64*1024 {
+	if len(data) > MaxBodyBytes+64*1024 {
 		return core.Message{}, fmt.Errorf("%w: frame too large (%d bytes)", core.ErrMalformed, len(data))
 	}
 	var m core.Message
@@ -172,46 +170,49 @@ func DecodeFrame(data []byte) (core.Message, error) {
 	if m.GroupID == ([32]byte{}) {
 		return m, fmt.Errorf("%w: zero group_id", core.ErrMalformed)
 	}
-	if !IsKnownType(m.Type) {
-		return m, fmt.Errorf("%w: unknown message type %q", core.ErrMalformed, m.Type)
+	if _, err := core.CheckBody(m.Kind, m.Body); err != nil {
+		return m, err
 	}
-	if len(m.Content) > MaxContentBytes {
-		return m, fmt.Errorf("%w: content too large", core.ErrMalformed)
+	if len(m.Body) > MaxBodyBytes {
+		return m, fmt.Errorf("%w: body too large", core.ErrMalformed)
 	}
 	return m, nil
 }
 
-// HideContent 是 hide 消息的 content（CanonicalJSON 编码）：要软删除的目标消息 id。
+// ErrMalformedWrap 把任意解析错误归入 ErrMalformed 语义（供调用方 errors.Is 判定）。
+func ErrMalformedWrap(err error) error { return fmt.Errorf("%w: %v", core.ErrMalformed, err) }
+
+// HideBody 是 hide 命令的载荷（tagged union 里的 {"hide": {…}}）。
 // 规则（PLAN）：target_msg_id 须与原发送者同 pubkey；hide 不可被 hide。
-type HideContent struct {
+type HideBody struct {
 	TargetMsgID string `json:"target_msg_id"`
 }
 
-// EncodeHideContent 规范化打包 hide content。
-func EncodeHideContent(targetMsgID string) ([]byte, error) {
+// EncodeHideBody 规范化打包 hide 命令正文。
+func EncodeHideBody(targetMsgID string) ([]byte, error) {
 	if targetMsgID == "" {
 		return nil, fmt.Errorf("%w: empty hide target", core.ErrMalformed)
 	}
-	return core.CanonicalJSON(HideContent{TargetMsgID: targetMsgID})
+	return core.MakeBody(core.NameHide, HideBody{TargetMsgID: targetMsgID})
 }
 
-// DecodeHideContent 解析 hide content；容忍非规范化 JSON（wire 上游可能重组过字节）。
-func DecodeHideContent(b []byte) (HideContent, error) {
-	var hc HideContent
-	if err := json.Unmarshal(b, &hc); err != nil {
-		return hc, fmt.Errorf("%w: hide content: %v", core.ErrMalformed, err)
+// DecodeHideBody 解析 hide 命令正文；容忍非规范化 JSON（wire 上游可能重组过字节）。
+func DecodeHideBody(b []byte) (HideBody, error) {
+	var hb HideBody
+	if err := core.BodyPayload(b, core.NameHide, &hb); err != nil {
+		return hb, err
 	}
-	if hc.TargetMsgID == "" {
-		return hc, fmt.Errorf("%w: hide content without target_msg_id", core.ErrMalformed)
+	if hb.TargetMsgID == "" {
+		return hb, fmt.Errorf("%w: hide body without target_msg_id", core.ErrMalformed)
 	}
-	return hc, nil
+	return hb, nil
 }
 
-// NewHide 构造并签名一条 hide 事件（本人只能隐藏自己发的消息，同 pubkey 校验在接收端做）。
+// NewHide 构造并签名一条 hide 命令（本人只能隐藏自己发的消息，同 pubkey 校验在接收端做）。
 func NewHide(signer core.Signer, groupID [32]byte, tsMS int64, targetMsgID string) (core.Message, error) {
-	content, err := EncodeHideContent(targetMsgID)
+	body, err := EncodeHideBody(targetMsgID)
 	if err != nil {
 		return core.Message{}, err
 	}
-	return NewMessage(signer, groupID, &core.Message{Type: core.TypeHide, TSms: tsMS, Content: content}, nil)
+	return NewMessage(signer, groupID, &core.Message{Kind: core.KindCommand, TSms: tsMS, Body: body}, nil)
 }

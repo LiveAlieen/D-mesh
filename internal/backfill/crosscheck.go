@@ -212,8 +212,9 @@ func crossCheck(
 			}
 			appeal = true // 定向申诉唯一通道：仅放行给解禁权限者，不要求 speak
 		}
-		switch m.Type {
-		case core.TypeText, core.TypeHide:
+		name, _ := core.BodyName(m.Body)
+		switch name {
+		case core.NameText, core.NameHide:
 			if !appeal && !r.HasPerm(m.Sender, core.PermSpeak) {
 				for sk := range support[best] {
 					res.drop(srcByKey[sk], id, DropNoSpeak, "sender lacks speak at receive time", penalize)

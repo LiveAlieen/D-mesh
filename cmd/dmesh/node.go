@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -411,9 +410,17 @@ func (n *node) onHideMsg(m core.Message) { n.persist(m) }
 func (n *node) onAppeal(m core.Message) {
 	n.persist(m)
 	if !n.interactive {
-		fmt.Fprintf(os.Stdout, "[appeal] %s -> %s: %s\n", m.Sender, m.To, string(m.Content))
+		fmt.Fprintf(os.Stdout, "[appeal] %s -> %s: %s\n", m.Sender, m.To, bodyForLog(m))
 	}
 	n.pushEvent(ui.AppealEvent{Msg: m})
+}
+
+// bodyForLog 供无头 stdout 打印：聊天取 text 正文，命令/扩展显示 body 原文。
+func bodyForLog(m core.Message) string {
+	if s, ok := core.TextOf(m); ok {
+		return s
+	}
+	return string(m.Body)
 }
 
 func (n *node) onPenalty(from core.PubKey, reason message.RejectReason, m *core.Message, err error) {
@@ -426,7 +433,7 @@ func (n *node) onPenalty(from core.PubKey, reason message.RejectReason, m *core.
 		n.blockl.Add(from, "bad_signature", 30_000)
 	case message.ReasonUnknownAlg:
 		n.scores.PenalizePub(from, spam.EvUnknownAlg) // v16：未知算法轻罚（宁拒不误信）
-	case message.ReasonMalformed, message.ReasonUnknownType:
+	case message.ReasonMalformed, message.ReasonUnknownName:
 		n.scores.PenalizePub(from, spam.EvSpam)
 	default: // 越权/黑名单/非成员/无 speak：spam/差评
 		n.scores.PenalizePub(from, spam.EvRepeatViolation)
@@ -435,11 +442,11 @@ func (n *node) onPenalty(from core.PubKey, reason message.RejectReason, m *core.
 		n.log.Printf("blocklisting %s (score=%d last=%s)", from, n.scores.ScorePub(from), reason)
 		n.blockl.Add(from, string(reason), 5*60_000)
 	}
-	mtype := "<nil>"
+	mname := "<nil>"
 	if m != nil {
-		mtype = m.Type
+		mname, _ = core.BodyName(m.Body)
 	}
-	n.log.Printf("penalty %s from=%s type=%s: %v", reason, from, mtype, err)
+	n.log.Printf("penalty %s from=%s name=%s: %v", reason, from, mname, err)
 }
 
 // persist 把已受理消息写入 JSONL（幂等；真相源）。
@@ -456,25 +463,30 @@ func (n *node) persist(m core.Message) {
 // publish 把本机已签名消息：①名单事件先过本机 ApplyEvent（同样的验签/层级规则）
 // ②写 store ③engine.Publish flood。
 func (n *node) publish(m core.Message) error {
-	if message.IsRosterEvent(m.Type) {
+	name, _ := core.BodyName(m.Body)
+	if message.IsRosterEvent(name) {
 		if err := n.roster.ApplyEvent(m); err != nil {
-			return fmt.Errorf("local apply %s: %w", m.Type, err)
+			return fmt.Errorf("local apply %s: %w", name, err)
 		}
 	}
 	n.persist(m)
 	if _, err := n.engine.Publish(m); err != nil {
-		return fmt.Errorf("publish %s: %w", m.Type, err)
+		return fmt.Errorf("publish %s: %w", name, err)
 	}
 	return nil
 }
 
-// signAndPublish 构造/签名并广播一个名单事件（Content 用 group.EncodeEventContent）。
-func (n *node) signAndPublish(typ string, content any, tsMS int64) error {
-	cb, err := group.EncodeEventContent(content)
+// signAndPublish 构造/签名并广播一个名单事件（body 用 group.EncodeEventBody）。
+func (n *node) signAndPublish(name string, payload any, tsMS int64) error {
+	kind, ok := core.KindOf(name)
+	if !ok {
+		return fmt.Errorf("%w: unknown event name %q", core.ErrMalformed, name)
+	}
+	cb, err := group.EncodeEventBody(name, payload)
 	if err != nil {
 		return err
 	}
-	m := core.Message{Type: typ, Content: cb, TSms: tsMS}
+	m := core.Message{Kind: kind, Body: cb, TSms: tsMS}
 	if err := group.SignEvent(&m, n.id, n.gid); err != nil {
 		return err
 	}
@@ -497,7 +509,11 @@ func (n *node) sendTextID(text string) (string, error) {
 		return "", fmt.Errorf("本机发送过快，稍后再试")
 	}
 	ts := n.now()
-	m := core.Message{Type: core.TypeText, Content: []byte(text), TSms: ts}
+	body, err := core.TextBody(text)
+	if err != nil {
+		return "", err
+	}
+	m := core.Message{Kind: core.KindMessage, Body: body, TSms: ts}
 	signed, err := message.NewMessage(n.id, n.gid, &m, nil)
 	if err != nil {
 		return "", err
@@ -519,7 +535,7 @@ func (n *node) publishPresence(lastTS int64) error {
 	if lastTS > ts {
 		lastTS = ts
 	}
-	return n.signAndPublish(core.TypePresence, presenceContent{
+	return n.signAndPublish(core.NamePresence, presenceContent{
 		Pub: n.self, LastMsgTS: lastTS, OfflineAfter: n.getOffline(),
 	}, ts)
 }
@@ -689,7 +705,7 @@ type presenceContent struct {
 // onJoinReq：本机具 carry 权限时受理入群请求（engine 已验签，这里补语义校验）。
 func (n *node) onJoinReq(m core.Message) {
 	var c joinReqContent
-	if err := json.Unmarshal(m.Content, &c); err != nil {
+	if err := core.BodyPayload(m.Body, core.NameJoinReq, &c); err != nil {
 		return
 	}
 	if !c.Pub.Equal(m.Sender) || c.WG.IsZero() {
@@ -747,7 +763,7 @@ func (n *node) approveJoin(msgID string) error {
 	if len(perms) == 0 {
 		perms = []string{core.PermSpeak, core.PermReceive}
 	}
-	if err := n.signAndPublish(core.TypeJoin, joinContent{Pub: req.Msg.Sender, WG: req.ApplicantWG, Perms: perms}, n.now()); err != nil {
+	if err := n.signAndPublish(core.NameJoin, joinContent{Pub: req.Msg.Sender, WG: req.ApplicantWG, Perms: perms}, n.now()); err != nil {
 		return err
 	}
 	n.jmu.Lock()

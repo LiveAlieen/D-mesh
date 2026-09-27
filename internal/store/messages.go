@@ -20,7 +20,7 @@ var ErrClosed = errors.New("store: closed")
 //	返回值 appended=false 且 err=nil  → msg_id 已存在（重复 flood/回灌），静默去重；
 //	返回值 err!=nil                   → 未写入任何东西（含 JSONL 写失败时的回滚）。
 //
-// type=hide 的事件在落库后自动对被指向的 target msg_id 打软删除标记。
+// name=hide 的事件在落库后自动对被指向的 target msg_id 打软删除标记。
 func (s *Store) AppendMessage(m core.Message) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -34,9 +34,10 @@ func (s *Store) AppendMessage(m core.Message) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("store: encode message: %w", err)
 	}
+	name, _ := core.BodyName(m.Body)
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO messages(msg_id, sender, ts_ms, type, data) VALUES(?,?,?,?,?)`,
-		m.MsgID, m.Sender.String(), m.TSms, m.Type, raw)
+		`INSERT OR IGNORE INTO messages(msg_id, sender, ts_ms, name, data) VALUES(?,?,?,?,?)`,
+		m.MsgID, m.Sender.String(), m.TSms, name, raw)
 	if err != nil {
 		return false, fmt.Errorf("store: insert message: %w", err)
 	}
@@ -55,8 +56,8 @@ func (s *Store) AppendMessage(m core.Message) (bool, error) {
 		s.rollbackMsg(m.MsgID)
 		return false, fmt.Errorf("store: sync jsonl: %w", err)
 	}
-	if m.Type == core.TypeHide {
-		for _, target := range hideTargets(m.Content) {
+	if name == core.NameHide {
+		for _, target := range hideTargets(m.Body) {
 			if _, err := s.db.Exec(`INSERT OR IGNORE INTO hidden(msg_id) VALUES(?)`, target); err != nil {
 				return false, fmt.Errorf("store: mark hidden: %w", err)
 			}
@@ -88,13 +89,14 @@ func (s *Store) rebuildIndex() error {
 			skipped++
 			return nil
 		}
+		name, _ := core.BodyName(m.Body)
 		if _, err := s.db.Exec(
-			`INSERT OR IGNORE INTO messages(msg_id, sender, ts_ms, type, data) VALUES(?,?,?,?,?)`,
-			m.MsgID, m.Sender.String(), m.TSms, m.Type, raw); err != nil {
+			`INSERT OR IGNORE INTO messages(msg_id, sender, ts_ms, name, data) VALUES(?,?,?,?,?)`,
+			m.MsgID, m.Sender.String(), m.TSms, name, raw); err != nil {
 			return fmt.Errorf("store: reindex %s: %w", m.MsgID, err)
 		}
-		if m.Type == core.TypeHide {
-			for _, target := range hideTargets(m.Content) {
+		if name == core.NameHide {
+			for _, target := range hideTargets(m.Body) {
 				if _, err := s.db.Exec(`INSERT OR IGNORE INTO hidden(msg_id) VALUES(?)`, target); err != nil {
 					return fmt.Errorf("store: reindex hidden: %w", err)
 				}
@@ -111,16 +113,26 @@ func (s *Store) rebuildIndex() error {
 	return nil
 }
 
-// hideTargets 解析 hide 消息 Content 指向的目标 msg_id（可为 0/1/多个）。
-// 兼容两种格式：JSON 对象（target_msg_id|msg_id|target 键）与裸字符串。
-func hideTargets(content []byte) []string {
-	s := strings.TrimSpace(string(content))
+// hideTargets 解析 hide 消息 body 指向的目标 msg_id（可为 0/1/多个）。
+// body 是标签联合 {"hide":{…}}，先剥标签再走宽松扫描：兼容 JSON 对象
+// （target_msg_id|msg_id|target|target_ids 键）与裸字符串。
+func hideTargets(body []byte) []string {
+	s := strings.TrimSpace(string(body))
 	if s == "" {
 		return nil
 	}
 	if strings.HasPrefix(s, "{") {
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(s), &obj); err == nil {
+			switch inner := obj[core.NameHide].(type) {
+			case map[string]any:
+				obj = inner // {"hide":{"target_msg_id":"…"}}：规范形态
+			case string:
+				if inner != "" {
+					return []string{inner} // {"hide":"…"}：裸目标
+				}
+				return nil
+			}
 			var out []string
 			for _, k := range []string{"target_msg_id", "msg_id", "target", "target_ids"} {
 				switch v := obj[k].(type) {
@@ -205,8 +217,8 @@ func (s *Store) IsHidden(targetMsgID string) (bool, error) {
 
 // MessageQuery 是消息查询过滤器；零值 = 全量按插入序升序。
 type MessageQuery struct {
-	Types         []string     // 空 = 所有类型（含名单事件）
-	ExcludeTypes  []string     // 例如只要聊天流：ExcludeTypes=[除 text 外的事件类型]
+	Names         []string     // 空 = 所有具体消息（含名单命令）
+	ExcludeNames  []string     // 例如只要聊天流：ExcludeNames=[除 text 外的消息名]
 	Sender        *core.PubKey // nil = 不限发送者
 	SinceMS       int64        // ts_ms >= SinceMS（0 = 不限）
 	UntilMS       int64        // ts_ms <= UntilMS（0 = 不限）
@@ -226,15 +238,15 @@ func (s *Store) QueryMessages(q MessageQuery) ([]core.Message, error) {
 		where []string
 		args  []any
 	)
-	if len(q.Types) > 0 {
-		where = append(where, "type IN ("+placeholders(len(q.Types))+")")
-		for _, t := range q.Types {
+	if len(q.Names) > 0 {
+		where = append(where, "name IN ("+placeholders(len(q.Names))+")")
+		for _, t := range q.Names {
 			args = append(args, t)
 		}
 	}
-	if len(q.ExcludeTypes) > 0 {
-		where = append(where, "type NOT IN ("+placeholders(len(q.ExcludeTypes))+")")
-		for _, t := range q.ExcludeTypes {
+	if len(q.ExcludeNames) > 0 {
+		where = append(where, "name NOT IN ("+placeholders(len(q.ExcludeNames))+")")
+		for _, t := range q.ExcludeNames {
 			args = append(args, t)
 		}
 	}

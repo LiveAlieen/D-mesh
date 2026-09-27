@@ -56,7 +56,7 @@ func RegisterEd25519Verifier() {
 }
 
 // SignEvent 构造并签名一个名单事件消息：
-//   - 填充 m.Sender/m.Alg（来自 signer），Content 建议用 EncodeEventContent 生成；
+//   - 填充 m.Sender/m.Alg（来自 signer），Body 须用 EncodeEventBody 生成（kind 同步取 core.KindOf）；
 //   - MsgID 为空时自动生成随机 hex id；
 //   - 签名原文 = core.MessageSigPayload(m)（含 group_id，绑定群与签名域）。
 func SignEvent(m *core.Message, signer core.Signer, groupID [32]byte) error {

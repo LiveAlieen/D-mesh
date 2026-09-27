@@ -193,7 +193,7 @@ func TestCrossCheckMultiSource(t *testing.T) {
 		plain := makeText(t, bl, "spam", 100, "bl-plain")
 		to := x.pub()
 		// 定向申诉：To 在签名前写入（MessageSigPayload 原文含 to，签后改 To 即伪签）。
-		appeal := makeMsgTo(t, bl, core.TypeText, "appeal", 101, "bl-appeal", &to)
+		appeal := makeMsgTo(t, bl, core.NameText, "appeal", 101, "bl-appeal", &to)
 		r := seedRoster()
 		pt := newPenTracker()
 		cr := crossCheck([]srcMsgs{
@@ -213,7 +213,7 @@ func TestCrossCheckMultiSource(t *testing.T) {
 
 	t.Run("定向申诉To指向无解禁权限者仍拒绝", func(t *testing.T) {
 		to := y.pub() // 普通成员无 kick/unban：不构成「唯一通道」的目标
-		appeal := makeMsgTo(t, bl, core.TypeText, "appeal-misdirected", 102, "bl-to-member", &to)
+		appeal := makeMsgTo(t, bl, core.NameText, "appeal-misdirected", 102, "bl-to-member", &to)
 		r := seedRoster()
 		pt := newPenTracker()
 		cr := crossCheck([]srcMsgs{

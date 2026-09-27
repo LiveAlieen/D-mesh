@@ -22,7 +22,7 @@ func TestPresenceSelfOnlyMaxMerge(t *testing.T) {
 	e.mustApply(e.joinAs(e.creat, bob.Pub(), base+1, mkWG(11)))
 
 	p := func(s core.Signer, last, after int64) core.Message {
-		return e.ev(s, core.TypePresence, eventPresence{Pub: s.Pub(), LastMsgTS: last, OfflineAfter: after}, last)
+		return e.ev(s, core.NamePresence, eventPresence{Pub: s.Pub(), LastMsgTS: last, OfflineAfter: after}, last)
 	}
 	// 本人自签推进。
 	e.mustApply(p(alice, base+10, 60_000))
@@ -39,23 +39,23 @@ func TestPresenceSelfOnlyMaxMerge(t *testing.T) {
 		t.Fatalf("stale presence overwrote: %+v", got)
 	}
 	// 同 ts 窗口内可更新阈值。
-	e.mustApply(e.ev(alice, core.TypePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 10, OfflineAfter: 45_000}, base+12))
+	e.mustApply(e.ev(alice, core.NamePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 10, OfflineAfter: 45_000}, base+12))
 	if got := e.r.Presence(alice.Pub()); got.OfflineAfter != 45_000 {
 		t.Fatalf("offline_after not refreshed: %+v", got)
 	}
 	// 代签/代报一律丢弃。
-	proxy := e.ev(bob, core.TypePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 999, OfflineAfter: 1}, base+999)
+	proxy := e.ev(bob, core.NamePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 999, OfflineAfter: 1}, base+999)
 	e.wantErr(proxy, core.ErrNotPermitted)
 	if got := e.r.Presence(alice.Pub()); got.LastMsgTS == base+999 {
 		t.Fatal("proxy presence applied!")
 	}
 	// 自相矛盾：last_msg_ts 晚于消息自身 ts。
-	e.wantErr(e.ev(alice, core.TypePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 500, OfflineAfter: 0}, base+100), core.ErrMalformed)
+	e.wantErr(e.ev(alice, core.NamePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 500, OfflineAfter: 0}, base+100), core.ErrMalformed)
 	// 负值拒绝。
-	e.wantErr(e.ev(alice, core.TypePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base, OfflineAfter: -1}, base+101), core.ErrMalformed)
+	e.wantErr(e.ev(alice, core.NamePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base, OfflineAfter: -1}, base+101), core.ErrMalformed)
 	// 非成员 presence → 拒。
 	stranger := mkSigner(t, 55)
-	e.wantErr(e.ev(stranger, core.TypePresence, eventPresence{Pub: stranger.Pub(), LastMsgTS: base, OfflineAfter: 0}, base+102), core.ErrNotPermitted)
+	e.wantErr(e.ev(stranger, core.NamePresence, eventPresence{Pub: stranger.Pub(), LastMsgTS: base, OfflineAfter: 0}, base+102), core.ErrNotPermitted)
 	// presence 不占白名单。
 	if _, ok := e.r.Member(bob.Pub()); !ok {
 		t.Fatal("bob still member (sanity)")
@@ -89,7 +89,7 @@ func TestNetdiskBoundsAndAuthority(t *testing.T) {
 	}
 	mb := 0
 	for i, tc := range tcs {
-		m := e.ev(tc.signer, core.TypeNetdisk, eventNetdisk{MB: tc.mb}, base+int64(i)+1)
+		m := e.ev(tc.signer, core.NameNetdisk, eventNetdisk{MB: tc.mb}, base+int64(i)+1)
 		if tc.wantErr != nil {
 			e.wantErr(m, tc.wantErr)
 			continue
@@ -104,9 +104,9 @@ func TestNetdiskBoundsAndAuthority(t *testing.T) {
 		}
 	}
 	// 群主把 netdisk 位授给成员（须群主层级+本人持有）后，成员仍不可签 netdisk。
-	e.mustApply(e.ev(e.creat, core.TypePerms, eventPerms{Target: alice.Pub(),
+	e.mustApply(e.ev(e.creat, core.NamePerms, eventPerms{Target: alice.Pub(),
 		Perms: []string{core.PermSpeak, core.PermReceive, core.PermNetdisk}}, base+20))
-	e.wantErr(e.ev(alice, core.TypeNetdisk, eventNetdisk{MB: 5}, base+21), core.ErrNotPermitted)
+	e.wantErr(e.ev(alice, core.NameNetdisk, eventNetdisk{MB: 5}, base+21), core.ErrNotPermitted)
 }
 
 // TestNetdiskQuotaEventWireContract 钉住跨包字节契约：internal/netdisk 签发的配额
@@ -114,11 +114,11 @@ func TestNetdiskBoundsAndAuthority(t *testing.T) {
 // 字段名写成 netdisk_mb，本包判 unknown field，「改配额」在全网永远不生效（v25 实测）。
 func TestNetdiskQuotaEventWireContract(t *testing.T) {
 	e := newEnv(t, Options{})
-	content, err := netdisk.NetdiskEventContent(9)
+	content, err := netdisk.NetdiskEventBody(9)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := core.Message{Type: core.TypeNetdisk, TSms: e.now + 1, Content: content}
+	m := core.Message{Kind: core.KindCommand, Body: content, TSms: e.now + 1}
 	if err := SignEvent(&m, e.creat, e.gid); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestJoinReqInbox(t *testing.T) {
 	e := newEnv(t, Options{})
 	base := e.now - 50_000
 	newcomer := mkSigner(t, 60)
-	req := e.ev(newcomer, core.TypeJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(60), Ref: "abc"}, base)
+	req := e.ev(newcomer, core.NameJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(60), Ref: "abc"}, base)
 	e.mustApply(req)
 	if e.r.MemberCount() != 1 {
 		t.Fatal("join_req must not change whitelist")
@@ -147,8 +147,8 @@ func TestJoinReqInbox(t *testing.T) {
 		t.Fatal("inbox should drain")
 	}
 	// 同一申请人重复申请只留最新。
-	e.mustApply(e.ev(newcomer, core.TypeJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(60)}, base+1))
-	e.mustApply(e.ev(newcomer, core.TypeJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(61)}, base+2))
+	e.mustApply(e.ev(newcomer, core.NameJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(60)}, base+1))
+	e.mustApply(e.ev(newcomer, core.NameJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(61)}, base+2))
 	qs = e.r.PollJoinReqs()
 	if len(qs) != 1 || qs[0].TSms != base+2 {
 		t.Fatalf("dedup inbox = %+v", qs)
@@ -156,14 +156,14 @@ func TestJoinReqInbox(t *testing.T) {
 	// 成员发 join_req → 拒。
 	alice := mkSigner(t, 10)
 	e.mustApply(e.joinAs(e.creat, alice.Pub(), base+3, mkWG(10)))
-	e.wantErr(e.ev(alice, core.TypeJoinReq, eventJoinReq{Pub: alice.Pub(), WG: mkWG(10)}, base+4), core.ErrNotPermitted)
+	e.wantErr(e.ev(alice, core.NameJoinReq, eventJoinReq{Pub: alice.Pub(), WG: mkWG(10)}, base+4), core.ErrNotPermitted)
 	// 代报（content.pub != sender）→ 拒。
-	e.wantErr(e.ev(alice, core.TypeJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(62)}, base+5), core.ErrMalformed)
+	e.wantErr(e.ev(alice, core.NameJoinReq, eventJoinReq{Pub: newcomer.Pub(), WG: mkWG(62)}, base+5), core.ErrMalformed)
 	// 缺 wg_pub → 拒。
-	e.wantErr(e.ev(alice, core.TypeJoinReq, eventJoinReq{Pub: alice.Pub()}, base+6), core.ErrMalformed)
+	e.wantErr(e.ev(alice, core.NameJoinReq, eventJoinReq{Pub: alice.Pub()}, base+6), core.ErrMalformed)
 	// 被拉黑者的 join_req → 拒（黑名单优先）。
-	e.mustApply(e.ev(e.creat, core.TypeKick, eventTarget{Target: alice.Pub()}, base+7))
-	e.wantErr(e.ev(alice, core.TypeJoinReq, eventJoinReq{Pub: alice.Pub(), WG: mkWG(10)}, base+8), core.ErrNotPermitted)
+	e.mustApply(e.ev(e.creat, core.NameKick, eventTarget{Target: alice.Pub()}, base+7))
+	e.wantErr(e.ev(alice, core.NameJoinReq, eventJoinReq{Pub: alice.Pub(), WG: mkWG(10)}, base+8), core.ErrNotPermitted)
 }
 
 // --- 签名/算法（v16 可插拔） ------------------------------------------------------
@@ -182,8 +182,8 @@ func TestSignatureAndAlgRules(t *testing.T) {
 	})
 	t.Run("tamperedContent", func(t *testing.T) {
 		m := good
-		m.Content = append([]byte(nil), m.Content...)
-		m.Content[0] ^= 0x20
+		m.Body = append([]byte(nil), m.Body...)
+		m.Body[0] ^= 0x20
 		e.wantErr(m, core.ErrInvalidSig)
 	})
 	t.Run("wrongGroup", func(t *testing.T) {
@@ -192,15 +192,15 @@ func TestSignatureAndAlgRules(t *testing.T) {
 		e.wantErr(m, core.ErrMalformed)
 	})
 	t.Run("directedMessageNotEvent", func(t *testing.T) {
-		m := e.ev(e.creat, core.TypeNetdisk, eventNetdisk{MB: 1}, base+1)
+		m := e.ev(e.creat, core.NameNetdisk, eventNetdisk{MB: 1}, base+1)
 		to := alice.Pub()
 		m.To = &to
 		e.wantErr(m, core.ErrMalformed)
 	})
 	t.Run("chatTypesRejected", func(t *testing.T) {
-		m := e.ev(alice, core.TypeText, "hi", base+1)
+		m := e.ev(alice, core.NameText, "hi", base+1)
 		e.wantErr(m, core.ErrMalformed)
-		m2 := e.ev(alice, core.TypeHide, "x", base+1)
+		m2 := e.ev(alice, core.NameHide, "x", base+1)
 		e.wantErr(m2, core.ErrMalformed)
 		m3 := e.ev(alice, "bogus_type", "x", base+1)
 		e.wantErr(m3, core.ErrMalformed)
@@ -217,7 +217,7 @@ func TestSignatureAndAlgRules(t *testing.T) {
 	})
 	t.Run("unknownAlgRejected", func(t *testing.T) {
 		fake := &algSigner{alg: "sm2-not-registered", pub: []byte("fake-pub")}
-		m := core.Message{Type: core.TypeNetdisk, TSms: base + 1}
+		m := core.Message{Kind: core.KindCommand, Body: []byte(`{"netdisk":{"mb":9}}`), TSms: base + 1}
 		if err := SignEvent(&m, fake, e.gid); err != nil {
 			t.Fatal(err)
 		}
@@ -237,14 +237,14 @@ func TestSignatureAndAlgRules(t *testing.T) {
 		defer core.Register("x-test", nil)
 		dave := &algSigner{alg: "x-test", pub: []byte("dave")}
 		creator := e.creat // ed25519 拉人者
-		e.mustApply(e.ev(creator, core.TypeJoin, eventJoin{Pub: dave.Pub(), WG: mkWG(70),
+		e.mustApply(e.ev(creator, core.NameJoin, eventJoin{Pub: dave.Pub(), WG: mkWG(70),
 			Perms: e.cfg.DefaultPerms}, base+2))
 		if e.r.TierOf(dave.Pub()) != core.TierMember {
 			t.Fatal("x-test member should be in whitelist")
 		}
 		// x-test 成员自签 presence 走新算法验签。
-		m := core.Message{Type: core.TypePresence, TSms: base + 3,
-			Content: mustEnc(e.t, eventPresence{Pub: dave.Pub(), LastMsgTS: base + 3})}
+		m := core.Message{Kind: core.KindExtension, TSms: base + 3,
+			Body: mustBody(e.t, core.NamePresence, eventPresence{Pub: dave.Pub(), LastMsgTS: base + 3})}
 		if err := SignEvent(&m, dave, e.gid); err != nil {
 			t.Fatal(err)
 		}
@@ -253,7 +253,7 @@ func TestSignatureAndAlgRules(t *testing.T) {
 			t.Fatalf("cross-alg presence = %+v", got)
 		}
 		// 群主用 ed25519 改 x-test 成员权限：跨算法信任成立。
-		e.mustApply(e.ev(creator, core.TypePerms, eventPerms{Target: dave.Pub(),
+		e.mustApply(e.ev(creator, core.NamePerms, eventPerms{Target: dave.Pub(),
 			Perms: []string{core.PermReceive}}, base+4))
 		if got := e.memberPerms(dave.Pub()); len(got) != 1 || got[0] != core.PermReceive {
 			t.Fatalf("perms = %v", got)
@@ -274,9 +274,9 @@ func (a *algSigner) Sign(msg []byte) ([]byte, error) {
 	return append([]byte("x:"), a.pub...), nil
 }
 
-func mustEnc(t *testing.T, v any) []byte {
+func mustBody(t *testing.T, name string, payload any) []byte {
 	t.Helper()
-	b, err := EncodeEventContent(v)
+	b, err := EncodeEventBody(name, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestIdempotentApply(t *testing.T) {
 	if e.r.MemberCount() != 2 {
 		t.Fatalf("member count = %d", e.r.MemberCount())
 	}
-	kick := e.ev(e.creat, core.TypeKick, eventTarget{Target: alice.Pub()}, base+1)
+	kick := e.ev(e.creat, core.NameKick, eventTarget{Target: alice.Pub()}, base+1)
 	e.mustApply(kick)
 	e.mustApply(kick)
 	if n, _, _ := e.r.Snapshot(); len(n) != 1 {
@@ -309,11 +309,11 @@ func TestTimeWindowRejects(t *testing.T) {
 	alice := mkSigner(t, 10)
 	e.mustApply(e.joinAs(e.creat, alice.Pub(), base, mkWG(10)))
 	// 未来超限。
-	e.wantErr(e.ev(e.creat, core.TypeNetdisk, eventNetdisk{MB: 1}, e.now+501), core.ErrMalformed)
+	e.wantErr(e.ev(e.creat, core.NameNetdisk, eventNetdisk{MB: 1}, e.now+501), core.ErrMalformed)
 	// 远古重放（低于低水位-宽限）。
-	e.wantErr(e.ev(e.creat, core.TypeNetdisk, eventNetdisk{MB: 1}, base-1001), core.ErrMalformed)
+	e.wantErr(e.ev(e.creat, core.NameNetdisk, eventNetdisk{MB: 1}, base-1001), core.ErrMalformed)
 	// 未来但在偏差内 → 允许（进入乱序缓存或直接应用）。
-	e.mustApply(e.ev(e.creat, core.TypeNetdisk, eventNetdisk{MB: 2}, e.now+400))
+	e.mustApply(e.ev(e.creat, core.NameNetdisk, eventNetdisk{MB: 2}, e.now+400))
 	if e.r.NetdiskMB() != 2 {
 		t.Fatal("within-skew future event must apply")
 	}
@@ -328,8 +328,8 @@ func TestOutOfOrderHoldAndReapplyInTSOrder(t *testing.T) {
 
 	// 两个 perms 事件：t1（[speak]）与 t2（[receive]），若按 t2→t1 立即应用，
 	// 最终权限将是 [speak]；正确行为是按 ts 升序应用 → 最终 [receive]。
-	p1 := e.ev(e.creat, core.TypePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermSpeak}}, base+10)
-	p2 := e.ev(e.creat, core.TypePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermReceive}}, base+20)
+	p1 := e.ev(e.creat, core.NamePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermSpeak}}, base+10)
+	p2 := e.ev(e.creat, core.NamePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermReceive}}, base+20)
 
 	e.applyNoFlush(p2) // 迟到的高位事件 → 进缓存（尚未生效）
 	if got := e.memberPerms(alice.Pub()); len(got) != 2 {
@@ -364,7 +364,7 @@ func TestOutOfOrderLateWithinWatermark(t *testing.T) {
 	base := e.now - 50_000
 	alice := mkSigner(t, 10)
 	e.mustApply(e.joinAs(e.creat, alice.Pub(), base+100, mkWG(10))) // watermark=base+100
-	late := e.ev(e.creat, core.TypePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermSpeak}}, base+50)
+	late := e.ev(e.creat, core.NamePerms, eventPerms{Target: alice.Pub(), Perms: []string{core.PermSpeak}}, base+50)
 	e.mustApply(late) // ts <= watermark → 立即应用（不入缓存）
 	if e.r.PendingCount() != 0 {
 		t.Fatal("late event should not be held")
@@ -394,7 +394,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				e := newEnv(t, Options{})
 				a, ts := e.bootstrapAdmin(20, e.now-50_000)
 				b, tsb := e.bootstrapAdmin(30, ts)
-				return e, e.ev(a, core.TypePerms, eventPerms{Target: b.Pub(), Perms: []string{core.PermSpeak}}, tsb+1), b.Pub()
+				return e, e.ev(a, core.NamePerms, eventPerms{Target: b.Pub(), Perms: []string{core.PermSpeak}}, tsb+1), b.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 		},
@@ -407,7 +407,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				o := mkSigner(t, 11)
 				e.mustApply(e.joinAs(e.creat, m.Pub(), base, mkWG(10)))
 				e.mustApply(e.joinAs(e.creat, o.Pub(), base+1, mkWG(11)))
-				return e, e.ev(m, core.TypePerms, eventPerms{Target: o.Pub(), Perms: []string{core.PermSpeak}}, base+2), o.Pub()
+				return e, e.ev(m, core.NamePerms, eventPerms{Target: o.Pub(), Perms: []string{core.PermSpeak}}, base+2), o.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 		},
@@ -446,7 +446,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				base := e.now - 50_000
 				alice := mkSigner(t, 10)
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), base, mkWG(10)))
-				return e, e.ev(alice, core.TypeRemove, eventTarget{Target: alice.Pub()}, base+1), alice.Pub()
+				return e, e.ev(alice, core.NameRemove, eventTarget{Target: alice.Pub()}, base+1), alice.Pub()
 			},
 			wantErr: nil,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -466,7 +466,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				admin, ts := e.bootstrapAdmin(20, base, core.PermKick) // 具 kick 权限者代签 remove
 				alice := mkSigner(t, 10)
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), ts, mkWG(10)))
-				return e, e.ev(admin, core.TypeRemove, eventTarget{Target: alice.Pub()}, ts+1), alice.Pub()
+				return e, e.ev(admin, core.NameRemove, eventTarget{Target: alice.Pub()}, ts+1), alice.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -487,7 +487,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				admin, ts := e.bootstrapAdmin(20, base) // 管理，但无 kick 位
 				alice := mkSigner(t, 10)
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), ts, mkWG(10)))
-				return e, e.ev(admin, core.TypeKick, eventTarget{Target: alice.Pub()}, ts+1), alice.Pub()
+				return e, e.ev(admin, core.NameKick, eventTarget{Target: alice.Pub()}, ts+1), alice.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -503,7 +503,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				base := e.now - 50_000
 				a, ts := e.bootstrapAdmin(20, base, core.PermKick)
 				b, tsb := e.bootstrapAdmin(30, ts, core.PermKick) // 同为管理（层级相同）
-				return e, e.ev(a, core.TypeKick, eventTarget{Target: b.Pub()}, tsb+1), b.Pub()
+				return e, e.ev(a, core.NameKick, eventTarget{Target: b.Pub()}, tsb+1), b.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -520,10 +520,10 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				base := e.now - 50_000
 				x := mkSigner(t, 10)
 				e.mustApply(e.joinAs(e.creat, x.Pub(), base, mkWG(10)))
-				e.mustApply(e.ev(e.creat, core.TypeKick, eventTarget{Target: x.Pub()}, base+1)) // x 进黑名单
+				e.mustApply(e.ev(e.creat, core.NameKick, eventTarget{Target: x.Pub()}, base+1)) // x 进黑名单
 				alice := mkSigner(t, 11)                                                        // 普通成员，无 unban/kick 位
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), base+2, mkWG(11)))
-				return e, e.ev(alice, core.TypeUnban, eventTarget{Target: x.Pub()}, base+3), x.Pub()
+				return e, e.ev(alice, core.NameUnban, eventTarget{Target: x.Pub()}, base+3), x.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -543,7 +543,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), base, mkWG(10)))
 				e.mustApply(e.joinAs(e.creat, bob.Pub(), base+1, mkWG(11)))
 				// bob 代报 alice 的在场：pub != sender。
-				return e, e.ev(bob, core.TypePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 10, OfflineAfter: 60_000}, base+10), alice.Pub()
+				return e, e.ev(bob, core.NamePresence, eventPresence{Pub: alice.Pub(), LastMsgTS: base + 10, OfflineAfter: 60_000}, base+10), alice.Pub()
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, victim core.PubKey) {
@@ -557,7 +557,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 			name: "netdiskOutOfRangeRejected",
 			build: func(t *testing.T) (*env, core.Message, core.PubKey) {
 				e := newEnv(t, Options{})
-				return e, e.ev(e.creat, core.TypeNetdisk, eventNetdisk{MB: 300}, e.now-50_000), core.PubKey{}
+				return e, e.ev(e.creat, core.NameNetdisk, eventNetdisk{MB: 300}, e.now-50_000), core.PubKey{}
 			},
 			wantErr: core.ErrMalformed,
 			post: func(t *testing.T, e *env, _ core.PubKey) {
@@ -574,7 +574,7 @@ func TestV16PermissionSemanticsMatrix(t *testing.T) {
 				alice := mkSigner(t, 10)
 				e.mustApply(e.joinAs(e.creat, alice.Pub(), base, mkWG(10)))
 				// 取值在合法区间内，但签名者层级不足 → 拒（隔离「越权」与「越界」）。
-				return e, e.ev(alice, core.TypeNetdisk, eventNetdisk{MB: 5}, base+1), core.PubKey{}
+				return e, e.ev(alice, core.NameNetdisk, eventNetdisk{MB: 5}, base+1), core.PubKey{}
 			},
 			wantErr: core.ErrNotPermitted,
 			post: func(t *testing.T, e *env, _ core.PubKey) {
