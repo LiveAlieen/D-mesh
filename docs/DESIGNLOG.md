@@ -106,6 +106,11 @@
 - **原话**：「当前项目是命令太多了将命令全部改为gui操作后续所有 添加的操作都是用gui」（2026-09-27）
 - **追问裁定**：① 命令去留 = 「GUI 彻底废除，无头保留」——窗口内不再解析任何斜杠命令，`/` 开头的输入按普通聊天文本原样发送；`ParseCommand` 退为无头 stdin（`cmd/dmesh/node.go`）专用，脚本与 E2E 通道语义零变化。② 落地节奏 = 「全量一次到位」——24 类命令 + 全部面板字母键动作一批换成 GUI 控件，不分批。
 - 定稿（PLAN 条目 18）：全量映射表（命令→顶栏按钮/行右键菜单/勾选与下拉对话框/原生文件选择框）；输入框从此只承载聊天正文；删除数字键 1..6 抢键切面板（打字首字符「1」被吞属缺陷），面板切换用鼠标点标签、Tab 作导航快捷键保留；基建 = `internal/ui/actions.go`（`Action{ID,Label,Enabled,Confirm}` + `PanelActions()`/`RunAction()`，不适用项置灰不隐藏）、`ViewLine.Row` 加性字段（鼠标命中→选中行精确映射，右击先选中再弹菜单）、统一浮层栈（dialog 四型 text/number/choice/checks + menu，Esc 关最上层）、Windows `comdlg32!GetOpenFileNameW` 原生文件选择框（stdlib syscall，无 cgo、零新依赖，LockOSThread goroutine 经 deliver 异步回投；非 Windows 或失败回退手输路径文本框）。**协议层、`ui.App` 门面、事件结构零改动**——所有动作复用既有 Kick/Unban/SetPerms/ApproveJoin/… 方法。langs 补 `gui.*` 键并改写 help/面板提示；`commands_test.go` 保留（无头），`viewmodel_test.go` 经 submit 下发命令的用例改走 RunAction/对话框。验收：门禁全绿 + 真窗口逐项点完映射表 + 双实例 E2E（GUI 点击签 join→消息落盘送达）+ 无头命令回归零变化。
+- **落实记录（2026-09-27）**：映射表全部落地，`progress.go` 补 v25 行；门禁=gofmt/vet 静默、`go test -count=1 ./...` 13 包全绿。真窗口实测覆盖：标签点选切面板、顶栏 帮助/设置/退群、成员行右键菜单六项、任命管理→撤销管理（事件落 `messages.jsonl` 且 `[管理]`→`[成员]` 实时回显、按钮随之置灰）、复制公钥（系统剪贴板取到完整 pubkey）、网盘配额数字框改 6→`{"mb":6}` 落盘→面板「每人配额 6 MB / 总量 24.0MiB」、清屏与退群双确认（确定生效/取消出「已取消」）、设置→界面语言中英往返整窗重渲染、原生文件选择框（核对种子与上传各弹一次，标题自定义）。
+  - **偏差一（推翻定稿）**：原生选择框**不能**放在 `LockOSThread` 工作线程里跑——协程退出即销毁该线程，Windows 的鼠标捕获留在已消失的线程上，实测对话框关闭后本窗口再也收不到任何点击。改为在持有本窗口 HWND 的 UI 线程上同步弹出（`comdlg32` 自带消息泵），PLAN 条目 18 已同步改写。
+  - **偏差二（越出「协议层零改动」范围，已如实报备）**：真窗口点配额时系统行报「local apply netdisk: malformed: event content: unknown field "kind"」，追出生产端/解码端字段契约不一致——`internal/netdisk` 签发 `{"kind":"netdisk_config","netdisk_mb":N}`，而落名单的权威解码器 `internal/group` 是 `eventNetdisk{MB int json:"mb"}` 严格解码（DisallowUnknownFields），于是**「改配额」在全网从未生效**（v14 起既有缺陷，与 v25 无关，只是 GUI 首次把它点出来）。已把生产端正文改为 `{"mb":N}`，并在 `internal/group/events_test.go` 加 `TestNetdiskQuotaEventWireContract` 钉死跨包字节契约。因该类事件过去从未被任何节点应用成功，不存在兼容数据受影响的问题。
+  - 遗留：网盘「上传文件」实传到落盘需两个可写主机，本机环境只跑得起一个可写端，故上传块传输仍按环境限制超时（选择框→执行链路本身已验证通畅）。
+
 
 ## 附：口头问答定论（未成版本，但为消歧义记录）
 - 「发送消息的时间戳是怎么来的？」→ 定论：`ts_ms` 为**发送者本机时钟自报 + 本人签名锁死**；接收端另存本地收到时刻仅参考；时钟偏差/虚报无法证伪（已知风险），故**一切安全判定不依赖时间戳真值**（在场=展示属性，名单收敛=靠签名链+多源比对而非 ts）。

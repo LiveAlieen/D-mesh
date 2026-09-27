@@ -1,12 +1,15 @@
 // viewmodel_test.go：viewModel 纯状态机测试（无窗口、无 ebiten 依赖）。
-// 场景清单对齐 v18 的终端 TUI model_test：发送文本、无 speak 被拒、
-// hide 标记、入站事件、面板切换、join 审批含 seed 门槛、transfer 提案 a/d、
-// admin kick/perms 提示流、申诉 unban、chat 命令分发、audit 结果、视图冒烟。
+// v25 起场景一律走控件路径：按钮/右键菜单/对话框 → ui.App 门面方法。
+// 场景清单：发送文本、无 speak 被拒、斜杠永不解析、hide 标记、入站事件、
+// 面板切换与数字键不抢面板、浮层（菜单/五型对话框/模态屏蔽/校验）、
+// join 审批含 seed 门槛、transfer 联署与拒绝、成员除名/权限/任命/移交、
+// 黑名单解禁、申诉、网盘上传/下载/删除/配额、audit 回 chat、视图冒烟。
 
 package ui
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -53,6 +56,13 @@ func (f *fakeApp) GroupID() [32]byte   { return f.gid }
 func (f *fakeApp) SendText(s string) error {
 	f.record("SendText:" + s)
 	return nil
+}
+
+// SendTextID 实现 TextIDAck（v25）：发送成功后回报稳定 msg_id，
+// 让单测能覆盖「自己刚发的那条随即可隐藏」。
+func (f *fakeApp) SendTextID(s string) (string, error) {
+	f.record("SendText:" + s)
+	return "echo-1", nil
 }
 func (f *fakeApp) Hide(id string) error { f.record("Hide:" + id); return nil }
 func (f *fakeApp) Leave() error         { f.record("Leave"); return nil }
@@ -233,6 +243,99 @@ func snapText(v *viewModel) string {
 	return b.String()
 }
 
+// ---- v25 GUI 路径助手：一律走「选行 → 菜单/按钮 → 表单」，不再打字下命令 ----
+
+// rowOf 返回当前面板里首行含 substr 的可选行序号（ClickRow 用，从 0 计）。
+func rowOf(t *testing.T, v *viewModel, substr string) int {
+	t.Helper()
+	for _, l := range v.Snapshot() {
+		if l.Row > 0 && strings.Contains(l.Text, substr) {
+			return l.Row - 1
+		}
+	}
+	t.Fatalf("no selectable row containing %q in:\n%s", substr, snapText(v))
+	return 0
+}
+
+func actionIDs(as []Action) []ActionID {
+	out := make([]ActionID, len(as))
+	for i, a := range as {
+		out[i] = a.ID
+	}
+	return out
+}
+
+// pickRowAction 复现右键链路：右键命中行→弹菜单→点其中一项。
+func pickRowAction(t *testing.T, v *viewModel, row int, id ActionID) {
+	t.Helper()
+	v.ClickRow(row, true)
+	for i, a := range v.Menu() {
+		if a.ID == id {
+			v.PickMenu(i)
+			return
+		}
+	}
+	t.Fatalf("row %d menu lacks action %q (menu=%v)", row, id, actionIDs(v.Menu()))
+}
+
+// hasAction 断言某排按钮里存在该动作（顶栏/面板动作条的可见性检查）。
+func hasAction(t *testing.T, as []Action, id ActionID) Action {
+	t.Helper()
+	for _, a := range as {
+		if a.ID == id {
+			return a
+		}
+	}
+	t.Fatalf("actions %v missing %q", actionIDs(as), id)
+	return Action{}
+}
+
+// mustDialog 取回当前浮层（没有就直接判失败）。
+func mustDialog(t *testing.T, v *viewModel) *dialog {
+	t.Helper()
+	if v.dlg == nil {
+		t.Fatal("no dialog open")
+	}
+	return v.dlg
+}
+
+// typeInto 往焦点浮层里打字（OnInput 会自行路由到对话框）。
+func typeInto(t *testing.T, v *viewModel, s string) {
+	t.Helper()
+	for _, r := range s {
+		v.OnInput(r)
+	}
+}
+
+// checkPerms 在 perms 勾选表单里把指定 Key 勾上（原本未勾才翻，勾了别翻回去）。
+func checkPerms(t *testing.T, v *viewModel, keys ...string) {
+	t.Helper()
+	d := mustDialog(t, v)
+	for _, k := range keys {
+		for i, it := range d.items {
+			if it.Key != k {
+				continue
+			}
+			if !it.Checked {
+				v.DialogClickItem(i)
+			}
+		}
+	}
+}
+
+// dialogKeyIndex 返回 choice 表单里指定 Key 的行号。
+func dialogKeyIndex(t *testing.T, v *viewModel, key string) int {
+	t.Helper()
+	d := mustDialog(t, v)
+	for i, it := range d.items {
+		if it.Key == key {
+			return i
+		}
+	}
+	t.Fatalf("dialog items missing %q", key)
+	return 0
+}
+
 // ---- 场景 ----
 
 func TestVMSendTextFlow(t *testing.T) {
@@ -251,6 +354,44 @@ func TestVMSendTextFlow(t *testing.T) {
 	if !strings.Contains(v.chat[1].text, "sent submitted") {
 		t.Errorf("note = %q", v.chat[1].text)
 	}
+	if v.chat[0].msgID != "echo-1" {
+		t.Errorf("宿主回报的 msg_id 未回填到回显行: %+v", v.chat[0])
+	}
+}
+
+// v25：自己刚发的那条在宿主回报 msg_id 后，右键菜单里就有「隐藏本条」，
+// 确认后走 Hide(<id>)；他人的消息永远不给隐藏项（协议上无权限）。
+func TestVMSelfMessageHideableAfterAck(t *testing.T) {
+	v, app := newTestVM(t)
+	typeText(t, v, "hide me")
+	v.RunAction(ActSend)
+	pickRowAction(t, v, 0, ActHide)
+	v.DialogAccept()
+	if !app.has("Hide:echo-1") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	if strings.Contains(snapText(v), "hide me") {
+		t.Fatalf("hidden line still visible:\n%s", snapText(v))
+	}
+	// 他人消息：只有复制。
+	other := keyPub(t, 0xbb)
+	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "m-other", Sender: other, TSms: 1700000000000,
+		Type: core.TypeText, Content: []byte("from other")}})
+	vis := 0
+	for _, l := range v.chat {
+		if l.hidden {
+			continue
+		}
+		if l.msgID == "m-other" {
+			break
+		}
+		vis++
+	}
+	v.ClickRow(vis, true)
+	if ids := fmt.Sprint(actionIDs(v.Menu())); strings.Contains(ids, string(ActHide)) ||
+		!strings.Contains(ids, string(ActCopy)) {
+		t.Fatalf("inbound row actions = %s, want copy only", ids)
+	}
 }
 
 func TestVMSpeakDenied(t *testing.T) {
@@ -268,14 +409,55 @@ func TestVMSpeakDenied(t *testing.T) {
 
 func TestVMHideMarksLine(t *testing.T) {
 	v, app := newTestVM(t)
-	msg := core.Message{MsgID: "m1", Sender: keyPub(t, 0xbb), TSms: 1, Type: core.TypeText, Content: []byte("secret")}
+	msg := core.Message{MsgID: "m1", Sender: app.self, TSms: 1700000000000, Type: core.TypeText, Content: []byte("secret")}
 	v.OnEvent(TextEvent{Msg: msg})
-	submit(t, v, "/hide m1")
+	pickRowAction(t, v, rowOf(t, v, "secret"), ActHide) // 自己的气泡右键=隐藏（先确认）
+	if mustDialog(t, v).kind != dlgConfirm {
+		t.Fatal("hide should ask for confirmation")
+	}
+	v.DialogAccept()
 	if !app.has("Hide:m1") {
 		t.Fatalf("calls = %v", app.calls)
 	}
 	if strings.Contains(snapText(v), "secret") {
 		t.Fatalf("hidden line still visible:\n%s", snapText(v))
+	}
+}
+
+// v25：GUI 输入框永不解析斜杠——整行按正文发出去（斜杠命令只在无头 stdin 活着）。
+func TestVMSlashIsPlainTextInGUI(t *testing.T) {
+	v, app := newTestVM(t)
+	submit(t, v, "/kick deadbeef")
+	if !app.has("SendText:/kick deadbeef") {
+		t.Fatalf("GUI must send slashes as chat text; calls=%v", app.calls)
+	}
+	if app.has("Kick") || strings.HasPrefix(strings.Join(app.calls, "|"), "Kick") {
+		t.Fatalf("slash command executed inside GUI: %v", app.calls)
+	}
+}
+
+// v25：右键菜单在场时 Esc 只收菜单，不动面板与输入。
+func TestVMMenuOverlayEsc(t *testing.T) {
+	v, app := newTestVM(t)
+	v.OnEvent(TextEvent{Msg: core.Message{MsgID: "c1", Sender: app.self, TSms: 1700000000000, Type: core.TypeText, Content: []byte("hi")}})
+	row := rowOf(t, v, "hi")
+	v.ClickRow(row, true)
+	if v.Menu() == nil {
+		t.Fatal("right click should open the row menu")
+	}
+	v.OnKey(KeyEscape)
+	if v.Menu() != nil {
+		t.Fatal("esc should close the menu")
+	}
+	if v.panel != PanelChat || app.has("Hide:c1") {
+		t.Fatalf("esc leaked into panel/action: %v %v", v.panel, app.calls)
+	}
+	v.ClickRow(row, false) // 左键只选中，不弹菜单
+	if v.Menu() != nil {
+		t.Fatal("left click must not open a menu")
+	}
+	if v.SelectedRow() != row {
+		t.Fatalf("sel = %d, want %d", v.SelectedRow(), row)
 	}
 }
 
@@ -315,26 +497,25 @@ func TestVMPanelSwitching(t *testing.T) {
 	if v.panel != PanelMembers {
 		t.Fatalf("panel = %v", v.panel)
 	}
-	if v.inputFocus {
-		t.Fatal("members panel should start with list focus")
-	}
 	v.OnKey(KeyEscape)
 	if v.panel != PanelChat {
 		t.Fatal("esc should return to chat")
 	}
+	// v25：数字键不再抢去切面板——它只是个字符，进聊天输入框。
 	v.OnInput('3')
-	if v.panel != PanelJoin {
-		t.Fatalf("digit switch = %v", v.panel)
+	if v.panel != PanelChat || string(v.input) != "3" {
+		t.Fatalf("digit stole the panel switch: panel=%v input=%q", v.panel, string(v.input))
 	}
-	// 输入非空时数字不触发切换（回 chat 后验证）。
-	v.setPanel(PanelChat)
-	v.input = []rune("1")
-	v.cur = 1
+	v.OnKey(KeyEscape) // esc 第一步清空输入
+	if len(v.input) != 0 {
+		t.Fatalf("esc should clear input: %q", string(v.input))
+	}
 	v.OnInput('2')
-	if v.panel != PanelChat || string(v.input) != "12" {
-		t.Fatalf("panel=%v input=%q", v.panel, string(v.input))
+	v.setPanel(PanelChat)
+	if v.panel != PanelChat {
+		t.Fatalf("panel = %v", v.panel)
 	}
-	// Shift-Tab 反向循环 + progress 占位存在。
+	// Shift-Tab 反向循环 + progress 面板存在。
 	v.setPanel(PanelChat)
 	v.OnKey(KeyShiftTab)
 	if v.panel != PanelProgress {
@@ -347,6 +528,10 @@ func TestVMPanelSwitching(t *testing.T) {
 	v.SwitchTab(99) // 越界忽略
 	if v.panel != PanelProgress {
 		t.Fatalf("out of range switch changed panel to %v", v.panel)
+	}
+	// 标签页序号与 SwitchTab 一致（点标签=切面板的唯一入口）。
+	if labels := TabLabels(); len(labels) != int(panelCount) || !strings.HasPrefix(labels[0], "1·") {
+		t.Fatalf("TabLabels = %v", labels)
 	}
 }
 
@@ -361,35 +546,54 @@ func TestVMJoinSeedGateAndApprove(t *testing.T) {
 	if v.panel != PanelJoin {
 		t.Fatalf("panel = %v", v.panel)
 	}
-	v.OnInput('a')
+	pickRowAction(t, v, 0, ActJoinApprove)
 	if app.has("ApproveJoin:req-1") {
 		t.Fatal("approved without seed verification")
 	}
 	if !strings.Contains(v.status, "seed") {
 		t.Fatalf("status = %q", v.status)
 	}
-	// 宿主核对通过翻转 SeedOK 后再按 a（joinAction 先 reload，宿主为事实源）。
+	// 宿主核对通过翻转 SeedOK 后再点「批准入群」（approveJoin 先 reload，宿主为事实源）。
 	req.SeedOK = true
 	app.joins = []JoinRequest{req}
-	v.OnInput('a')
+	pickRowAction(t, v, 0, ActJoinApprove)
 	if !app.has("ApproveJoin:req-1") {
 		t.Fatalf("ApproveJoin not called; calls=%v", app.calls)
 	}
-	// s 打开种子核对提示。
-	v.OnInput('s')
-	if v.prompt == nil || v.prompt.action != "seedcheck" {
-		t.Fatal("seedcheck prompt not opened")
+	// 未注入原生选择框 → 「核对种子」回退成手输路径文本框。
+	v.ClickRow(0, false)
+	v.RunAction(ActSeedCheck)
+	d := mustDialog(t, v)
+	if d.kind != dlgText {
+		t.Fatalf("seed check should fall back to a path form, got %v", d.kind)
 	}
-	v.OnKey(KeyEscape)
-	if v.prompt != nil {
-		t.Fatal("esc should cancel prompt")
+	typeInto(t, v, "no-such-seed.json")
+	v.DialogAccept()
+	if !strings.Contains(snapText(v)+"\n"+lastChat(v), "seedcheck") {
+		t.Fatalf("seedcheck note missing: %+v", v.chat)
 	}
-	// d 拒绝：本地出队。
-	app.joins = nil
-	v.OnInput('d')
-	if app.has("RejectJoin:req-1") {
-		t.Log("queue empty after host dequeue — reject skipped, fine")
+	// 注入选择框后不再弹表单，直接把路径交给执行。
+	var pickedTitle, pickedPath string
+	v.pickFile = func(title string, onPath func(string)) {
+		pickedTitle, pickedPath = title, "C:/seeds/g.json"
+		onPath(pickedPath)
 	}
+	v.RunAction(ActSeedCheck)
+	if pickedTitle == "" || v.dlg != nil {
+		t.Fatalf("native picker should replace the form (title=%q dlg=%v)", pickedTitle, v.dlg)
+	}
+	// d=拒绝：走菜单项，宿主出队后不再报错。
+	pickRowAction(t, v, 0, ActJoinReject)
+	if !app.has("RejectJoin:req-1") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+}
+
+func lastChat(v *viewModel) string {
+	if len(v.chat) == 0 {
+		return ""
+	}
+	return v.chat[len(v.chat)-1].text
 }
 
 func TestVMTransferProposalAdminPanel(t *testing.T) {
@@ -399,10 +603,10 @@ func TestVMTransferProposalAdminPanel(t *testing.T) {
 		Msg:       core.Message{MsgID: "xfer-1", Sender: old, TSms: 1700000000000},
 		FromOwner: true,
 	}
-	// 事件入箱：聊天流提示 /approve。
+	// 事件入箱：聊天流指向群管面板的右键菜单。
 	v.OnEvent(TransferProposalEvent{Prop: prop})
-	if !strings.Contains(v.chat[len(v.chat)-1].text, "/approve xfer-1") {
-		t.Fatalf("chat line = %q", v.chat[len(v.chat)-1].text)
+	if note := lastChat(v); !strings.Contains(note, "xfer-1") || !strings.Contains(note, "admin panel") {
+		t.Fatalf("chat line = %q", note)
 	}
 	app.transfers = []TransferProposal{prop}
 	app.joins = []JoinRequest{{Msg: core.Message{MsgID: "req-1", Sender: keyPub(t, 0xdd)}, Mode: core.ModeAuto, SeedOK: true}}
@@ -411,7 +615,7 @@ func TestVMTransferProposalAdminPanel(t *testing.T) {
 	if got := v.panelRows(); got != 1 {
 		t.Fatalf("join panelRows = %d, want 1", got)
 	}
-	v.OnInput('a')
+	pickRowAction(t, v, 0, ActJoinApprove)
 	if !app.has("ApproveJoin:req-1") || app.has("ApproveTransfer:xfer-1") {
 		t.Fatalf("calls = %v", app.calls)
 	}
@@ -424,13 +628,12 @@ func TestVMTransferProposalAdminPanel(t *testing.T) {
 	if s := snapText(v); !strings.Contains(s, "xfer-1") || !strings.Contains(s, "pending my endorse") {
 		t.Errorf("admin view missing transfer section:\n%s", s)
 	}
-	// 下移到 transfer 节：a=联署广播。
-	v.OnKey(KeyDown)
-	v.OnKey(KeyDown)
-	if v.sel != 2 {
-		t.Fatalf("sel = %d", v.sel)
+	// 选中 transfer 行 → 右键「联署提案」。
+	row := rowOf(t, v, "xfer-1")
+	if kind := v.adminSec().rowKind(row); kind != "transfer" {
+		t.Fatalf("rowKind = %q", kind)
 	}
-	v.OnInput('a')
+	pickRowAction(t, v, row, ActXferApprove)
 	if !app.has("ApproveTransfer:xfer-1") {
 		t.Fatalf("ApproveTransfer not called; calls=%v", app.calls)
 	}
@@ -441,77 +644,116 @@ func TestVMTransferProposalAdminPanel(t *testing.T) {
 	bad.FromOwner = false
 	app.transfers = []TransferProposal{bad}
 	v.reloadTransfers()
-	v.sel = len(v.members) + len(v.banned)
-	v.OnInput('a')
+	badRow := rowOf(t, v, "xfer-bad")
+	pickRowAction(t, v, badRow, ActXferApprove)
 	if app.has("ApproveTransfer:xfer-bad") {
 		t.Fatal("endorsed a proposal whose signer is not owner/creator")
 	}
 	if !strings.Contains(v.status, "not current owner") {
 		t.Fatalf("status = %q", v.status)
 	}
-	// d=拒绝：本地丢弃并出队，不转发。
-	v.OnInput('d')
+	// 「拒绝提案」：本地丢弃并出队，不转发。
+	pickRowAction(t, v, badRow, ActXferDeny)
 	if !app.has("RejectTransfer:xfer-bad") {
 		t.Fatalf("calls = %v", app.calls)
 	}
 	if len(v.transfers) != 0 {
 		t.Fatalf("transfer still queued after deny: %+v", v.transfers)
 	}
-	// 斜杠命令通道：/transfers、/approve latest、/deny <前缀>。
-	v.setPanel(PanelChat)
-	submit(t, v, "/transfers")
-	last := v.chat[len(v.chat)-1]
-	if !strings.Contains(last.text, "none pending") {
-		t.Fatalf("/transfers note = %q", last.text)
-	}
-	app.transfers = []TransferProposal{{Msg: core.Message{MsgID: "xfer-z", Sender: old}, FromOwner: true}}
-	submit(t, v, "/approve latest")
-	if !app.has("ApproveTransfer:latest") {
-		t.Fatalf("calls = %v", app.calls)
-	}
-	app.transfers = []TransferProposal{{Msg: core.Message{MsgID: "xfer-y", Sender: old}, FromOwner: true}}
-	submit(t, v, "/deny xfer")
-	if !app.has("RejectTransfer:xfer") {
-		t.Fatalf("calls = %v", app.calls)
-	}
 }
 
-func TestVMAdminKickAndPermsPrompt(t *testing.T) {
+func TestVMAdminKickAndPermsDialogs(t *testing.T) {
 	v, app := newTestVM(t)
 	v.SwitchTab(3) // admin
-	v.OnKey(KeyDown)
 	other := keyPub(t, 0xbb)
 	// 排序后在线优先：self=0，other(admin,离线)=1。
+	v.OnKey(KeyDown)
 	if !v.members[v.sel].Entry.Pub.Equal(other) {
 		t.Fatalf("sel lands on %s, want other", ShortID(v.members[v.sel].Entry.Pub))
 	}
-	v.OnInput('K')
+	// 除名是破坏性动作：菜单点击后先弹确认，取消不产生任何出站。
+	pickRowAction(t, v, v.sel, ActKick)
+	d := mustDialog(t, v)
+	if d.kind != dlgConfirm || !strings.Contains(d.note, "blacklist") {
+		t.Fatalf("kick confirm = %+v", d)
+	}
+	v.DialogCancel()
+	if app.has("Kick:" + other.Key()) {
+		t.Fatalf("cancelled confirm still fired: %v", app.calls)
+	}
+	pickRowAction(t, v, v.sel, ActKick)
+	v.DialogAccept()
 	if !app.has("Kick:" + other.Key()) {
 		t.Fatalf("calls = %v", app.calls)
 	}
-	// P 打开 perms 提示，输入 csv 回车生效。
-	v.OnInput('P')
-	if v.prompt == nil || v.prompt.action != "perms" {
-		t.Fatal("perms prompt not opened")
+	// 权限勾选表单：原本 speak+receive，勾上 carry 后提交。
+	pickRowAction(t, v, v.sel, ActPerms)
+	d = mustDialog(t, v)
+	if d.kind != dlgChecks || len(d.items) != len(core.AllPerms) {
+		t.Fatalf("perms form = %+v", d)
 	}
-	typeText(t, v, "speak,receive,carry")
-	v.OnKey(KeyEnter)
+	checkPerms(t, v, core.PermCarry)
+	v.DialogAccept()
 	if !app.has("SetPerms:" + other.Key() + "=speak,receive,carry") {
 		t.Fatalf("calls = %v", app.calls)
 	}
-	// esc 取消提示。
-	v.OnInput('P')
-	v.OnKey(KeyEscape)
-	if v.prompt != nil {
-		t.Fatal("prompt should be cancelled")
+	// 一项都不勾 = 拒绝提交并提示。
+	pickRowAction(t, v, v.sel, ActPerms)
+	d = mustDialog(t, v)
+	for i, it := range d.items { // 取消全部勾选
+		if it.Checked {
+			v.DialogClickItem(i)
+		}
 	}
-	// 列表焦点下 Esc 第一步退出列表焦点，第二步回 chat。
-	v.OnKey(KeyEscape)
-	if !v.inputFocus {
-		v.OnKey(KeyEscape)
+	v.DialogAccept()
+	if !strings.Contains(v.status, "at least one permission") {
+		t.Fatalf("status = %q", v.status)
 	}
+	// esc 关最上层浮层，不切面板。
+	pickRowAction(t, v, v.sel, ActPerms)
+	v.OnKey(KeyEscape)
+	if v.dlg != nil {
+		t.Fatal("esc should close the dialog")
+	}
+	if v.panel != PanelAdmin {
+		t.Fatalf("panel = %v", v.panel)
+	}
+	// 群管面板没有文本载体：编辑键无事可做，Esc 第二步才回聊天。
+	v.OnKey(KeyEnter)
+	v.OnKey(KeyEscape)
 	if v.panel != PanelChat {
 		t.Fatalf("panel = %v, want chat", v.panel)
+	}
+}
+
+// 顶栏与面板动作条的按钮可见性：不适用项置灰而非隐藏。
+func TestVMActionBarsExposeEverything(t *testing.T) {
+	v, _ := newTestVM(t)
+	for _, id := range []ActionID{ActHelp, ActAudit, ActSettings, ActLeave, ActQuit} {
+		hasAction(t, v.ToolbarActions(), id)
+	}
+	send := hasAction(t, v.PanelActions(), ActSend)
+	if send.Enabled {
+		t.Fatal("send must be greyed out with an empty input")
+	}
+	typeInto(t, v, "hi")
+	if !hasAction(t, v.PanelActions(), ActSend).Enabled {
+		t.Fatal("send must enable once the input has text")
+	}
+	v.SwitchTab(1) // members 恒有首行被选中；空列表面板才见置灰
+	if a := hasAction(t, v.PanelActions(), ActKick); !a.Enabled {
+		t.Fatal("kick should be enabled while a member row is selected")
+	}
+	v.SwitchTab(2) // join：队列为空 → 审批动作置灰摆着而非消失
+	if hasAction(t, v.PanelActions(), ActJoinApprove).Enabled {
+		t.Fatal("approve must be greyed out with an empty queue")
+	}
+	if a := hasAction(t, v.PanelActions(), ActRefresh); !a.Enabled {
+		t.Fatal("refresh must always be clickable")
+	}
+	v.SwitchTab(5) // progress 面板没有动作条
+	if len(v.PanelActions()) != 0 {
+		t.Fatalf("progress actions = %v", actionIDs(v.PanelActions()))
 	}
 }
 
@@ -529,120 +771,262 @@ func TestVMAppealUnbanAndIgnore(t *testing.T) {
 	if kind := v.adminSec().rowKind(v.sel); kind != "appeal" {
 		t.Fatalf("rowKind = %q", kind)
 	}
-	v.OnInput('u')
+	pickRowAction(t, v, v.sel, ActAppealUnban)
 	if !app.has("Unban:" + sender.Key()) {
 		t.Fatalf("calls = %v", app.calls)
 	}
-	v.OnInput('i') // 忽略：仅本地移除展示
+	pickRowAction(t, v, v.sel, ActAppealIgnore) // 忽略：仅本地移除展示
 	if len(v.appeals) != 0 {
 		t.Fatalf("appeal not dropped after ignore: %d", len(v.appeals))
 	}
 }
 
-func TestVMChatCommandsDispatch(t *testing.T) {
+// v25：原先 24 条斜杠命令各归一个控件。本测试按旧命令清单逐条走 GUI 路径，
+// 断言落到同一批 ui.App 门面方法上（协议层与门面零改动的证据）。
+func TestVMActionsCoverFormerCommands(t *testing.T) {
 	v, app := newTestVM(t)
-	target := keyPub(t, 0xbb)
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"/remove", "Leave"},
-		{"/audit", "Audit"},
-		{"/netdisk set 128", "SetNetdiskMB"},
-		{"/offline-after 90000", "SetOfflineAfter"},
-		{"/unban " + hexOf(target), "Unban:" + target.Key()},
-		{"/grant-admin " + hexOf(target), "GrantAdmin:" + target.Key()},
-		{"/revoke-admin " + hexOf(target), "RevokeAdmin:" + target.Key()},
-		{"/transfer " + hexOf(target), "Transfer:" + target.Key()},
-		{"/approve latest", "ApproveTransfer:latest"},
-		{"/deny abc123", "RejectTransfer:abc123"},
-		{"/hide zz", "Hide:zz"},
-		{"/kick " + hexOf(target), "Kick:" + target.Key()},
-		{"/perms " + hexOf(target) + " speak", "SetPerms:" + target.Key() + "=speak"},
-	}
-	for _, tc := range cases {
-		submit(t, v, tc.in)
-		if !app.has(tc.want) {
-			t.Errorf("%q did not trigger %s; calls=%v", tc.in, tc.want, app.calls)
-		}
-	}
-	// /netdisk upload 走网盘门面。
-	submit(t, v, "/netdisk upload /tmp/x.png")
 	nd := app.nd.(*fakeND)
-	if len(nd.calls) == 0 || nd.calls[0] != "Upload:/tmp/x.png" {
-		t.Errorf("netdisk calls = %v", nd.calls)
+
+	// /remove → 顶栏「退群」（破坏性：先确认）
+	v.RunAction(ActLeave)
+	if mustDialog(t, v).kind != dlgConfirm {
+		t.Fatal("leave should ask for confirmation")
 	}
-	// /help 与 /clear。
-	submit(t, v, "/help")
-	if len(v.chat) == 0 || !strings.Contains(v.chat[len(v.chat)-1].text, "commands:") {
-		t.Error("/help should append help to chat")
+	v.DialogAccept()
+	if !app.has("Leave") {
+		t.Fatalf("calls = %v", app.calls)
 	}
-	submit(t, v, "/clear")
+
+	// /offline-after 90000 → 数字表单
+	v.RunAction(ActOfflineTune)
+	if mustDialog(t, v).kind != dlgNumber {
+		t.Fatal("offline threshold should be a number form")
+	}
+	typeInto(t, v, "90000")
+	v.DialogAccept()
+	if !app.has("SetOfflineAfter") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	// 非数字输入：拦住并提示，不出站。
+	app.calls = nil
+	v.RunAction(ActOfflineTune)
+	typeInto(t, v, "abc")
+	v.DialogAccept()
+	if app.has("SetOfflineAfter") || !strings.Contains(v.status, "enter a number") {
+		t.Fatalf("number validation failed: calls=%v status=%q", app.calls, v.status)
+	}
+
+	// /grant-admin /revoke-admin /transfer → 成员行右键菜单
+	v.SwitchTab(1)
+	other := keyPub(t, 0xbb)
+	row := rowOf(t, v, "bbbbbb")
+	if !v.members[row].Entry.Pub.Equal(other) {
+		t.Fatalf("row %d is not the target member", row)
+	}
+	pickRowAction(t, v, row, ActGrant)
+	if !app.has("GrantAdmin:" + other.Key()) {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	pickRowAction(t, v, row, ActRevoke)
+	if !app.has("RevokeAdmin:" + other.Key()) {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	pickRowAction(t, v, row, ActTransfer)
+	if mustDialog(t, v).kind != dlgConfirm {
+		t.Fatal("transfer should ask for confirmation")
+	}
+	v.DialogAccept()
+	if !app.has("Transfer:" + other.Key()) {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	// 复制公钥走注入的剪贴板桩。
+	var clip string
+	v.copyText = func(s string) { clip = s }
+	pickRowAction(t, v, row, ActCopyPub)
+	if clip != other.String() || !strings.Contains(v.status, "clipboard") {
+		t.Fatalf("clip=%q status=%q", clip, v.status)
+	}
+
+	// /unban → 黑名单行右键菜单
+	app.r.banned = []core.BlacklistEntry{{Pub: keyPub(t, 0xcc), TS: 1700000000000}}
+	v.setPanel(PanelAdmin)
+	v.refreshRoster()
+	pickRowAction(t, v, len(v.members), ActUnban)
+	if !app.has("Unban:" + keyPub(t, 0xcc).Key()) {
+		t.Fatalf("calls = %v", app.calls)
+	}
+
+	// /netdisk upload <路径> → 「上传文件」按钮（原生选择框桩）
+	v.SwitchTab(4)
+	var pickTitle string
+	v.pickFile = func(title string, onPath func(string)) {
+		pickTitle = title
+		onPath("C:/pics/x.png")
+	}
+	v.RunAction(ActNDUpload)
+	if pickTitle == "" || len(nd.calls) == 0 || nd.calls[0] != "Upload:C:/pics/x.png" {
+		t.Fatalf("upload via picker: title=%q calls=%v", pickTitle, nd.calls)
+	}
+	// 下载 / 删除（确认）→ 文件行右键
+	fileRow := rowOf(t, v, "a.txt")
+	pickRowAction(t, v, fileRow, ActNDDownload)
+	if !strings.Contains(strings.Join(nd.calls, "|"), "Download:a.txt") {
+		t.Fatalf("nd calls = %v", nd.calls)
+	}
+	pickRowAction(t, v, fileRow, ActNDDelete)
+	if mustDialog(t, v).kind != dlgConfirm {
+		t.Fatal("delete should ask for confirmation")
+	}
+	v.DialogAccept()
+	if !strings.Contains(strings.Join(nd.calls, "|"), "Delete:a.txt") {
+		t.Fatalf("nd calls = %v", nd.calls)
+	}
+	// /netdisk set 128 → 配额数字表单（预填当前值，改完提交）
+	v.RunAction(ActNDQuota)
+	d := mustDialog(t, v)
+	if val, _ := d.DialogValue(); val != "64" {
+		t.Fatalf("quota form should prefill 64, got %q", val)
+	}
+	v.OnKey(KeyBackspace)
+	v.OnKey(KeyBackspace)
+	typeInto(t, v, "128")
+	v.DialogAccept()
+	if !app.has("SetNetdiskMB") {
+		t.Fatalf("calls = %v", app.calls)
+	}
+	// 越界配额：拦住。
+	v.RunAction(ActNDQuota)
+	v.OnKey(KeyBackspace)
+	v.OnKey(KeyBackspace)
+	v.OnKey(KeyBackspace)
+	typeInto(t, v, "9999")
+	v.DialogAccept()
+	if strings.Contains(v.status, "submitted") {
+		t.Fatalf("out-of-range quota accepted: status=%q", v.status)
+	}
+
+	// /help → 「帮助」按钮（系统行进聊天流，绝不出站）
+	v.setPanel(PanelChat)
+	app.calls = nil
+	v.RunAction(ActHelp)
+	if !strings.Contains(lastChat(v), "UI tour") || app.has("SendText") {
+		t.Fatalf("help: last=%q calls=%v", lastChat(v), app.calls)
+	}
+	// /clear → 「清屏」（确认）
+	v.RunAction(ActClear)
+	v.DialogAccept()
 	if len(v.chat) != 0 {
-		t.Errorf("clear left %d lines", len(v.chat))
-	}
-	// 解析错误只进 status。
-	before := len(v.chat)
-	submit(t, v, "/frobnicate")
-	if len(v.chat) != before || !strings.Contains(v.status, "input error") {
-		t.Fatalf("bad cmd: status=%q chat=%d", v.status, len(v.chat))
+		t.Fatalf("clear left %d lines", len(v.chat))
 	}
 }
 
 func TestVMQuit(t *testing.T) {
 	v, _ := newTestVM(t)
-	submit(t, v, "/quit")
+	v.RunAction(ActQuit)
 	if !v.QuitRequested() {
-		t.Fatal("/quit should request quit")
+		t.Fatal("the quit button should request quit")
 	}
 }
 
-// v22 补做 v18：/progress 双轨进度=系统行进聊天流 + 6·进度 面板渲染，绝不广播。
-func TestVMProgressCommand(t *testing.T) {
+// 对话框五型：确认/文本/数字/单选/多选各自的键盘与校验行为。
+func TestVMDialogKinds(t *testing.T) {
 	v, app := newTestVM(t)
-	submit(t, v, "/progress")
+
+	// choice：主题单选
+	defer SetTheme(string(GetTheme()))
+	SetTheme(string(ThemeLight))
+	v.RunAction(ActTheme)
+	d := mustDialog(t, v)
+	if d.kind != dlgChoice {
+		t.Fatalf("theme should be a single-choice form, got %v", d.kind)
+	}
+	v.DialogClickItem(dialogKeyIndex(t, v, string(ThemeDark)))
+	v.DialogAccept()
+	if GetTheme() != ThemeDark {
+		t.Fatalf("theme = %q", GetTheme())
+	}
+	// 未知值走 exec 的校验分支：只提示不切换
+	v.exec(ActTheme, actionCtx{theme: "neon"})
+	if GetTheme() != ThemeDark || !strings.Contains(v.status, "neon") {
+		t.Fatalf("bad theme: theme=%q status=%q", GetTheme(), v.status)
+	}
+
+	// checks：权限多选（空勾选须拒绝提交）
+	v.SwitchTab(1)
+	pickRowAction(t, v, rowOf(t, v, "bbbbbb"), ActPerms)
+	d = mustDialog(t, v)
+	if d.kind != dlgChecks {
+		t.Fatalf("perms should be a checklist form, got %v", d.kind)
+	}
+	v.DialogCancel()
+	if v.dlg != nil {
+		t.Fatal("cancel should close the form")
+	}
+
+	// 模态：浮层在场时其他动作一律不吃（清屏没执行、表单仍是数字型）
+	v.RunAction(ActOfflineTune)
+	v.RunAction(ActClear)
+	if len(v.chat) != 0 || mustDialog(t, v).kind != dlgNumber {
+		t.Fatal("a modal form must block other actions")
+	}
+	v.DialogCancel()
+
+	// text：未注入选择框时「核对种子」回退手输路径
+	v.setPanel(PanelChat)
+	before := len(v.chat)
+	v.RunAction(ActSeedCheck)
+	d = mustDialog(t, v)
+	if d.kind != dlgText {
+		t.Fatalf("seed check fallback should be a text form, got %v", d.kind)
+	}
+	v.DialogCancel()
+	if len(v.chat) != before {
+		t.Fatal("cancelled path form must not append chat lines")
+	}
+	if !strings.Contains(v.status, "cancel") {
+		t.Fatalf("status = %q", v.status)
+	}
+	_ = app
+}
+
+// v25：进度不再是命令，只有 6·进度 面板一轨；且永不广播。
+func TestVMProgressPanel(t *testing.T) {
+	v, app := newTestVM(t)
+	v.setPanel(PanelProgress)
 	var versions, milestones, pct bool
-	for _, l := range v.chat {
-		if !l.system {
-			continue
-		}
-		if strings.Contains(l.text, "Version changelog") {
+	for _, l := range v.Snapshot() {
+		if strings.Contains(l.Text, "Version changelog") {
 			versions = true
 		}
-		if strings.Contains(l.text, "Milestones") {
+		if strings.Contains(l.Text, "Milestones") {
 			milestones = true
 		}
-		if strings.Contains(l.text, "M0") && strings.Contains(l.text, "100%") {
+		if strings.Contains(l.Text, "M0") && strings.Contains(l.Text, "100%") {
 			pct = true
 		}
 	}
 	if !versions || !milestones || !pct {
-		t.Fatalf("progress lines incomplete: versions=%v milestones=%v pct=%v chat=%+v", versions, milestones, pct, v.chat)
+		t.Fatalf("progress panel incomplete: versions=%v milestones=%v pct=%v\n%s", versions, milestones, pct, snapText(v))
 	}
-	if app.has("SendText:/progress") || app.has("SendText") {
-		// 同测试内 submit 的其他命令不涉及，这里只禁 /progress 被当发言。
-		for _, c := range app.calls {
-			if strings.HasPrefix(c, "SendText:") && strings.Contains(c, "progress") {
-				t.Fatalf("/progress leaked into chat broadcast: %v", app.calls)
-			}
+	for _, c := range app.calls {
+		if strings.HasPrefix(c, "SendText") {
+			t.Fatalf("progress leaked into chat broadcast: %v", app.calls)
 		}
 	}
-	// 面板渲染同一数据。
-	v.setPanel(PanelProgress)
-	var inPanel bool
+	// 进度面板是只读展示：没有动作条，也没有可选行。
+	if len(v.PanelActions()) != 0 {
+		t.Fatalf("progress actions = %v", actionIDs(v.PanelActions()))
+	}
 	for _, l := range v.Snapshot() {
-		if strings.Contains(l.Text, "100%") {
-			inPanel = true
+		if l.Row != 0 {
+			t.Fatalf("progress rows must not be selectable: %+v", l)
 		}
-	}
-	if !inPanel {
-		t.Fatal("progress panel must render the same milestones")
 	}
 }
 
 func TestVMAuditResultsToChat(t *testing.T) {
 	v, _ := newTestVM(t)
-	submit(t, v, "/audit")
+	v.RunAction(ActAudit)
 	var found bool
 	for _, l := range v.chat {
 		if strings.Contains(l.text, "audit: all sources consistent") && l.system {
@@ -715,23 +1099,6 @@ func TestVMInputEditingAndPaste(t *testing.T) {
 	v.OnKey(KeyEscape)
 	if len(v.input) != 0 {
 		t.Fatalf("esc should clear input: %q", string(v.input))
-	}
-}
-
-func TestVMEnterFocusesInputOnListPanels(t *testing.T) {
-	v, app := newTestVM(t)
-	v.SwitchTab(1) // members，列表焦点
-	if v.inputFocus {
-		t.Fatal("members panel must start unfocused")
-	}
-	v.OnKey(KeyEnter) // 第一次 Enter：进入输入栏
-	if !v.inputFocus {
-		t.Fatal("Enter should focus input on list panels")
-	}
-	typeText(t, v, "hi")
-	v.OnKey(KeyEnter) // 第二次 Enter：提交
-	if !app.has("SendText:hi") {
-		t.Fatalf("calls = %v", app.calls)
 	}
 }
 
@@ -834,31 +1201,5 @@ func TestVMWrapTextHelper(t *testing.T) {
 	}
 	if styleColor(StyleStatus) != Pal().Status {
 		t.Error("status color mapping")
-	}
-}
-
-func TestVMThemeCommand(t *testing.T) {
-	defer SetTheme(string(GetTheme()))
-	SetTheme(string(ThemeLight))
-	v, app := newTestVM(t)
-	submit(t, v, "/theme")
-	if !strings.Contains(v.status, "light") {
-		t.Fatalf("query status = %q", v.status)
-	}
-	submit(t, v, "/theme dark")
-	if GetTheme() != ThemeDark || !strings.Contains(v.status, "dark") {
-		t.Fatalf("after /theme dark: theme=%q status=%q", GetTheme(), v.status)
-	}
-	submit(t, v, "/theme neon")
-	if GetTheme() != ThemeDark {
-		t.Fatal("unknown theme must not switch")
-	}
-	if !strings.Contains(v.status, "neon") {
-		t.Fatalf("bad theme status = %q", v.status)
-	}
-	for _, c := range app.calls {
-		if strings.HasPrefix(c, "SendText") && strings.Contains(c, "theme") {
-			t.Fatalf("/theme leaked into chat: %v", app.calls)
-		}
 	}
 }

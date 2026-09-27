@@ -234,8 +234,8 @@ func ageSuffix(ms int64, now time.Time) string {
 
 // ---- 网盘面板 ----
 
-// RenderNetdiskLines 渲染网盘总览 + 文件列表（纯文本，v20 起文案随语言）。
-func RenderNetdiskLines(s NetdiskStatus, files []NetdiskFile) []string {
+// RenderNetdiskStatusLines 渲染总览小字（v25：网盘面板顶部非选区）。
+func RenderNetdiskStatusLines(s NetdiskStatus) []string {
 	out := []string{
 		Tf("nd.quota", s.QuotaMB, humanBytes(s.TotalBytes), humanBytes(s.UsedBytes)),
 		Tf("nd.contrib", len(s.Contributors), s.OnlineWritable, s.DegradedStripes),
@@ -249,10 +249,12 @@ func RenderNetdiskLines(s NetdiskStatus, files []NetdiskFile) []string {
 	if s.QuotaMB == 0 {
 		out = append(out, Tr("nd.disabled"))
 	}
-	out = append(out, Tr("nd.files"))
-	if len(files) == 0 {
-		out = append(out, Tr("p.empty"))
-	}
+	return out
+}
+
+// RenderNetdiskFileLines 渲染文件列表（与 []NetdiskFile 同序，v25 起逐行可选）。
+func RenderNetdiskFileLines(files []NetdiskFile) []string {
+	out := make([]string, 0, len(files))
 	for _, f := range files {
 		h := Tr("nd.ok")
 		if !f.Healthy {
@@ -261,6 +263,16 @@ func RenderNetdiskLines(s NetdiskStatus, files []NetdiskFile) []string {
 		out = append(out, Tf("nd.fileLine", truncate(f.Name, 28), humanBytes(f.Size), f.Stripes, h))
 	}
 	return out
+}
+
+// RenderNetdiskLines 渲染网盘总览 + 文件列表（纯文本，v20 起文案随语言）。
+func RenderNetdiskLines(s NetdiskStatus, files []NetdiskFile) []string {
+	out := RenderNetdiskStatusLines(s)
+	out = append(out, Tr("nd.files"))
+	if len(files) == 0 {
+		return append(out, Tr("p.empty"))
+	}
+	return append(out, RenderNetdiskFileLines(files)...)
 }
 
 func humanBytes(b int64) string {

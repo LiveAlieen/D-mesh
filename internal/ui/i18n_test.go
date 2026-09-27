@@ -60,23 +60,34 @@ func TestSetLangRejectsUnknown(t *testing.T) {
 	}
 }
 
-func TestLangCommandDispatch(t *testing.T) {
+// v25：GUI 里语言经「设置 → 界面语言」单选表单切换；ParseCommand 的 /lang 只服务无头 stdin。
+func TestVMLangAction(t *testing.T) {
 	defer SetLang(GetLang())
 	v := newViewModel(nil)
-	v.dispatch(Command{Kind: CmdLang, Lang: "zh"})
+	v.RunAction(ActLang)
+	d := v.dlg
+	if d == nil || d.kind != dlgChoice {
+		t.Fatalf("language should open a single-choice form: %+v", d)
+	}
+	for i, it := range d.items {
+		if it.Key == "zh" {
+			v.DialogClickItem(i)
+		}
+	}
+	v.DialogAccept()
 	if GetLang() != LangZh {
-		t.Fatalf("after /lang zh, lang=%q", GetLang())
+		t.Fatalf("after picking zh, lang=%q", GetLang())
 	}
 	if !strings.Contains(v.status, "zh") && !strings.Contains(v.status, "语言") {
 		t.Fatalf("status not localized feedback: %q", v.status)
 	}
-	v.dispatch(Command{Kind: CmdLang, Lang: "en"})
+	v.exec(ActLang, actionCtx{lang: "en"})
 	if GetLang() != LangEn {
-		t.Fatalf("after /lang en, lang=%q", GetLang())
+		t.Fatalf("lang=%q", GetLang())
 	}
-	v.dispatch(Command{Kind: CmdLang, Lang: "de"})
+	v.exec(ActLang, actionCtx{lang: "de"})
 	if GetLang() != LangEn {
-		t.Fatalf("bad lang must not switch: %q", GetLang())
+		t.Fatalf("unknown language must not switch: %q", GetLang())
 	}
 	if !strings.Contains(v.status, "de") {
 		t.Fatalf("bad lang status: %q", v.status)

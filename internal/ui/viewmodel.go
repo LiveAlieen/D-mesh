@@ -1,10 +1,14 @@
 // viewmodel.go：GUI 的纯状态机（v19）。
 //
 // 本文件不 import ebiten：OnInput/OnKey/Submit/SwitchTab/ScrollBy/OnEvent/
-// Tick/Snapshot 全部是可无窗口单测的方法。ebiten 壳（game.go）只负责把
-// 键盘/鼠标/滚轮事件翻译成这些调用，并按 Snapshot() 的 ViewLine 绘制。
-// 行为规格移植自 v16-v18 的终端 TUI 模型（面板切换、chat 环形上限、
-// join seed 门槛、transfer a/d、admin 提示流、申诉 unban、audit 回 chat 等）。
+// Tick/Snapshot/ClickRow/RunAction 全部是可无窗口单测的方法。ebiten 壳
+// （game.go）只负责把键盘/鼠标/滚轮事件翻译成这些调用，并按 Snapshot() 的
+// ViewLine 绘制。
+//
+// v25 起 GUI 内不再有「打字下命令」这条路径：所有操作经 actions.go 的按钮/
+// 右键菜单/对话框进来，输入框只承载聊天正文；ParseCommand 只服务无头 stdin。
+// 行为规格仍移植自 v16-v18 的终端 TUI 模型（面板切换、chat 环形上限、
+// join seed 门槛、transfer 联署、申诉通道、audit 回 chat 等）。
 
 package ui
 
@@ -28,7 +32,7 @@ const (
 	PanelJoin
 	PanelAdmin
 	PanelNetdisk
-	PanelProgress // v18 /progress 欠账占位
+	PanelProgress
 	panelCount
 )
 
@@ -52,7 +56,7 @@ const (
 	StyleSelf                     // 自己发的聊天（右侧、暖色）
 	StyleSystem                   // 系统提示行（· 前缀，暗色）
 	StyleHeader                   // 面板小节标题
-	StyleDim                      // 键位提示等次要文字
+	StyleDim                      // 次要文字
 	StyleOnline                   // 在线/核对通过
 	StyleOffline                  // 离线
 	StyleBad                      // 黑名单/未核实签名
@@ -66,6 +70,8 @@ const (
 // 两者为空时渲染层回退整行 Text（旧行为，测试断言仍以 Text 为准）。
 // Avatar 为 v23 加分项：发送者 ShortID（头像色块取色/字母与连发分组用），
 // 非聊天行为空。
+// Row 为 v25 加分项：鼠标命中行 → 选中行的映射序号，从 1 起（0=标题/提示/系统
+// 行等不可选行，恰是零值，故旧构造点无需改动）；game 命中后回传 ClickRow(Row-1)。
 type ViewLine struct {
 	Text     string
 	Meta     string
@@ -73,6 +79,7 @@ type ViewLine struct {
 	Avatar   string
 	Style    LineStyle
 	Selected bool
+	Row      int
 }
 
 // ---- 按键（特殊键枚举；可打印字符走 OnInput）----
@@ -109,15 +116,17 @@ type chatLine struct {
 	sender core.PubKey // 入站/出站发送者（StyleSelf 判定用）
 	meta   string      // v20：气泡上方小字行（时间 · 发送者）
 	body   string      // v20：气泡正文（不含发送者前缀）
+	seq    int64       // v25：本机回显的本地序号，宿主回报 msg_id 后据此回填
 }
 
-// promptState 是面板里的单行输入提示（/perms 目标、种子路径等）。
-type promptState struct {
-	label  string
-	action string // seedcheck|perms
-	target core.PubKey
-	value  string
+// chatIDEvent 是包内事件（不经宿主通道）：异步出站成功后把真实 msg_id 回填到
+// 对应回显行（seq 匹配），使「隐藏本条」对自己刚发的消息也可用。
+type chatIDEvent struct {
+	seq   int64
+	msgID string
 }
+
+func (chatIDEvent) isUIEvent() {}
 
 // ---- viewModel ----
 
@@ -130,20 +139,29 @@ type viewModel struct {
 	cur    int // 输入栏光标（rune 下标）
 	status string
 
-	members    []MemberRow
-	banned     []core.BlacklistEntry
-	joinReqs   []JoinRequest
-	transfers  []TransferProposal // 发给本机的待决 transfer 提案（v17①，admin 面板）
-	appeals    []core.Message
-	sel        int
-	inputFocus bool // 非 chat 面板：false=列表焦点（动作键），true=输入栏焦点
+	members   []MemberRow
+	banned    []core.BlacklistEntry
+	joinReqs  []JoinRequest
+	transfers []TransferProposal // 发给本机的待决 transfer 提案（v17①，admin 面板）
+	appeals   []core.Message
+	sel       int // 当前面板的选中行（序号语义见 rowKindOf）
 
-	prompt *promptState
+	// v25 浮层：右键菜单与模态对话框（对话框在场时吃掉键盘输入）。
+	menu     []Action
+	menuSel  int
+	menuOpen bool
+	dlg      *dialog
+
+	// copyText/pickFile 由 game 注入（剪贴板与原生文件选择框）；pickFile 为 nil
+	// 时「选文件」类动作回退为手输路径文本框，单测里注入桩函数。
+	copyText func(string)
+	pickFile func(title string, onPath func(string))
 
 	ndStatus *NetdiskStatus
 	ndFiles  []NetdiskFile
 
 	chatScroll int // chat 距底部的行数（0=贴底自动跟随）
+	seqNo      int64
 	bodyHeight int // 最近一次的可视行数（渲染层回填，用于滚动夹取）
 	quit       bool
 	now        func() time.Time
@@ -155,7 +173,7 @@ type viewModel struct {
 
 // newViewModel 构造根状态机。
 func newViewModel(app App) *viewModel {
-	return &viewModel{app: app, now: time.Now, inputFocus: true}
+	return &viewModel{app: app, now: time.Now}
 }
 
 func (v *viewModel) currentTime() time.Time {
@@ -165,7 +183,7 @@ func (v *viewModel) currentTime() time.Time {
 	return time.Now()
 }
 
-// QuitRequested 报告 viewModel 是否请求退出（/quit 或宿主关闭）。
+// QuitRequested 报告 viewModel 是否请求退出（「退出」按钮或宿主关闭）。
 func (v *viewModel) QuitRequested() bool { return v.quit }
 
 // ---- 事件处理（与旧模型 handleEvent 逐条对齐）----
@@ -191,10 +209,12 @@ func (v *viewModel) OnEvent(ev Event) {
 		v.setStatus(Tf("ev.joinreq", ShortID(e.Req.Msg.Sender)))
 	case TransferProposalEvent:
 		v.upsertTransfer(e.Prop)
-		v.appendChat(chatLine{text: Tf("ev.xferChat", ShortID(e.Prop.Msg.Sender), e.Prop.Msg.MsgID, e.Prop.Msg.MsgID), system: true})
+		v.appendChat(chatLine{text: Tf("ev.xferChat", ShortID(e.Prop.Msg.Sender), e.Prop.Msg.MsgID), system: true})
 		v.setStatus(Tf("ev.xferStatus", ShortID(e.Prop.Msg.Sender)))
 	case HideEvent:
 		v.hideLine(e.MsgID)
+	case chatIDEvent:
+		v.attachChatID(e.seq, e.msgID)
 	case NetdiskEvent:
 		v.appendChat(chatLine{text: Tf("ev.netdisk", e.Note), system: true})
 		if v.panel == PanelNetdisk {
@@ -259,11 +279,28 @@ func (v *viewModel) setStatus(f string, args ...any) {
 }
 
 func (v *viewModel) appendChat(l chatLine) {
+	if l.seq == 0 && !l.system && l.msgID == "" {
+		v.seqNo++
+		l.seq = v.seqNo
+	}
 	v.chat = append(v.chat, l)
 	if len(v.chat) > 2000 {
 		v.chat = v.chat[len(v.chat)-1500:]
 	}
-	// 贴底时自动跟随新消息（chatScroll=0 即锚定底部）； scrolled-up 保持原位。
+	// 贴底时自动跟随新消息（chatScroll=0 即锚定底部）；已上滚则保持原位。
+}
+
+// attachChatID 把宿主回报的真实 msg_id 贴到对应回显行上（找不到 seq 就忽略）。
+func (v *viewModel) attachChatID(seq int64, msgID string) {
+	if seq == 0 || msgID == "" {
+		return
+	}
+	for i := range v.chat {
+		if v.chat[i].seq == seq {
+			v.chat[i].msgID = msgID
+			return
+		}
+	}
 }
 
 // ---- 宿主快照 ----
@@ -317,6 +354,9 @@ func (v *viewModel) refreshNetdisk() {
 	if fs, err := nd.List(); err == nil {
 		v.ndFiles = fs
 	}
+	if v.sel >= v.panelRows() {
+		v.sel = 0
+	}
 }
 
 func max0(n int) int {
@@ -360,7 +400,7 @@ func (v *viewModel) PrevTab() { v.setPanel((v.panel + panelCount - 1) % panelCou
 func (v *viewModel) setPanel(p Panel) {
 	v.panel = p
 	v.sel = 0
-	v.inputFocus = p == PanelChat
+	v.menuOpen, v.menu, v.menuSel, v.dlg = false, nil, 0, nil
 	switch p {
 	case PanelMembers, PanelAdmin:
 		v.refreshRoster()
@@ -372,11 +412,6 @@ func (v *viewModel) setPanel(p Panel) {
 	case PanelNetdisk:
 		v.refreshNetdisk()
 	}
-}
-
-// FocusInput 把焦点切到输入栏（鼠标点击输入行/按 Enter 进入编辑）。
-func (v *viewModel) FocusInput() {
-	v.inputFocus = true
 }
 
 // ---- 滚动 ----
@@ -414,7 +449,7 @@ func (v *viewModel) maxChatScroll() int {
 	return max0(vis - v.bodyHeight)
 }
 
-// ---- 输入栏（光标编辑 + 字符插入 + 粘贴）----
+// ---- 输入栏（聊天正文：光标编辑 + 字符插入 + 粘贴）----
 
 func (v *viewModel) insertRunes(rs []rune) {
 	if len(rs) == 0 {
@@ -428,26 +463,19 @@ func (v *viewModel) insertRunes(rs []rune) {
 	v.cur += len(rs)
 }
 
-// OnInput 注入一个可打印字符（含 IME 上屏字符）。
+// OnInput 注入一个可打印字符（含 IME 上屏字符）。v25：不再有「按键即动作」的
+// 路径，也不再抢数字键切面板——字符一律进当前焦点的文本载体（对话框优先）。
 func (v *viewModel) OnInput(r rune) {
 	if r < 0x20 {
 		return
 	}
-	if v.prompt != nil {
-		v.prompt.value += string(r)
+	if v.dlg != nil {
+		v.dialogInput(r)
 		return
 	}
-	if v.panel == PanelChat || v.inputFocus {
-		// chat 面板且输入为空时，数字 1..6 直切面板（照旧模型）。
-		if v.panel == PanelChat && len(v.input) == 0 && r >= '1' && r <= '0'+rune(panelCount) {
-			v.SwitchTab(int(r - '1'))
-			return
-		}
+	if v.panel == PanelChat {
 		v.insertRunes([]rune{r})
-		return
 	}
-	// 列表焦点：可打印字符即面板动作键。
-	v.panelAction(string(r))
 }
 
 // Paste 注入剪贴板内容（Ctrl+V）；换行折叠为空格（单行输入栏）。
@@ -456,19 +484,34 @@ func (v *viewModel) Paste(s string) {
 	if s == "" {
 		return
 	}
-	if v.prompt != nil {
-		v.prompt.value += s
+	if v.dlg != nil {
+		v.dlg.insert(s)
 		return
 	}
-	if v.panel == PanelChat || v.inputFocus {
+	if v.panel == PanelChat {
 		v.insertRunes([]rune(s))
 	}
 }
 
-// OnKey 注入特殊功能键。
+// OnKey 注入特殊功能键。浮层优先级：对话框 > 右键菜单 > 面板。
 func (v *viewModel) OnKey(k Key) {
-	if v.prompt != nil {
-		v.onPromptKey(k)
+	if v.dlg != nil {
+		v.dialogKey(k)
+		return
+	}
+	if v.menuOpen {
+		switch k {
+		case KeyEscape:
+			v.CloseMenu()
+		case KeyUp:
+			v.menuSel = max0(v.menuSel - 1)
+		case KeyDown:
+			v.menuSel = min(v.menuSel+1, len(v.menu)-1)
+		case KeyEnter:
+			v.PickMenu(v.menuSel)
+		default:
+			v.CloseMenu()
+		}
 		return
 	}
 	switch k {
@@ -483,24 +526,20 @@ func (v *viewModel) OnKey(k Key) {
 		case len(v.input) > 0:
 			v.input, v.cur = nil, 0
 		case v.panel != PanelChat:
-			if v.inputFocus {
-				v.inputFocus = false
-			} else {
-				v.setPanel(PanelChat)
-			}
+			v.setPanel(PanelChat)
 		}
 		return
 	case KeyUp:
 		if v.panel == PanelChat {
 			v.ScrollBy(-1)
-		} else if !v.inputFocus {
+		} else {
 			v.moveSel(-1)
 		}
 		return
 	case KeyDown:
 		if v.panel == PanelChat {
 			v.ScrollBy(1)
-		} else if !v.inputFocus {
+		} else {
 			v.moveSel(1)
 		}
 		return
@@ -515,19 +554,13 @@ func (v *viewModel) OnKey(k Key) {
 		}
 		return
 	case KeyEnter:
-		if v.panel != PanelChat && !v.inputFocus {
-			v.inputFocus = true // 非 chat 面板：Enter 先进入输入栏
-			return
+		if v.panel == PanelChat {
+			v.Submit()
 		}
-		v.Submit()
 		return
 	}
-	if v.panel != PanelChat && !v.inputFocus {
-		switch k {
-		case KeyLeft, KeyRight, KeyHome, KeyEnd, KeyBackspace, KeyDelete:
-			return // 列表焦点下不动光标
-		}
-		return
+	if v.panel != PanelChat {
+		return // 非聊天面板没有文本载体，编辑键无事可做
 	}
 	switch k {
 	case KeyBackspace:
@@ -554,6 +587,9 @@ func (v *viewModel) OnKey(k Key) {
 	}
 }
 
+// MenuSel 返回右键菜单的键盘高亮项。
+func (v *viewModel) MenuSel() int { return v.menuSel }
+
 func (v *viewModel) moveSel(d int) {
 	n := v.panelRows()
 	if n == 0 {
@@ -563,136 +599,14 @@ func (v *viewModel) moveSel(d int) {
 	v.sel = max0(min(v.sel+d, n-1))
 }
 
-// Submit 提交输入栏（Enter）：斜杠命令走 ParseCommand 分发（与无头 stdin
-// 同一语义），普通文本走 SendText。
+// Submit 提交输入栏（Enter）：v25 起整行都是聊天正文，斜杠不再解析。
 func (v *viewModel) Submit() {
 	line := string(v.input)
 	v.input, v.cur = nil, 0
-	if strings.TrimSpace(line) == "" {
-		return
-	}
-	cmd, err := ParseCommand(line)
-	if err != nil {
-		v.setStatus(Tf("st.inputErr", err))
-		return
-	}
-	v.dispatch(cmd)
+	v.sendText(strings.TrimSpace(line))
 }
 
-// ---- 命令分发（逐条移植旧模型 dispatch）----
-
-func (v *viewModel) dispatch(c Command) {
-	if c.Kind == CmdText && !v.hasPerm(core.PermSpeak) {
-		v.setStatus(Tr("st.noSpeak"))
-		return
-	}
-	switch c.Kind {
-	case CmdHelp:
-		v.appendChat(chatLine{text: Tr("help.text"), system: true})
-	case CmdClear:
-		v.chat, v.chatScroll = nil, 0
-	case CmdQuit:
-		v.quit = true
-	case CmdLang:
-		if c.Lang == "" {
-			v.setStatus(Tf("st.langNow", string(GetLang()), LangList()))
-			return
-		}
-		if SetLang(Lang(c.Lang)) {
-			v.setStatus(Tf("st.langSet", string(GetLang())))
-		} else {
-			v.setStatus(Tf("st.langBad", c.Lang, LangList()))
-		}
-	case CmdTheme:
-		if c.Theme == "" {
-			v.setStatus(Tf("st.themeNow", string(GetTheme()), ThemeList()))
-			return
-		}
-		if SetTheme(c.Theme) {
-			v.setStatus(Tf("st.themeSet", string(GetTheme())))
-		} else {
-			v.setStatus(Tf("st.themeBad", c.Theme, ThemeList()))
-		}
-	case CmdText:
-		msg := v.outboundDraft(c.Text)
-		v.appendChat(chatLine{text: FormatChatLine(msg), sender: v.selfPub(), meta: chatMeta(msg), body: chatBody(msg)})
-		v.fire(Tr("act.sent"), func() error { return v.app.SendText(c.Text) })
-	case CmdHide:
-		v.hideLine(c.MsgID)
-		v.fire(Tr("act.hide"), func() error { return v.app.Hide(c.MsgID) })
-	case CmdAudit:
-		v.audit()
-	case CmdRemove:
-		v.fire(Tr("act.leave"), func() error { return v.app.Leave() })
-	case CmdKick:
-		v.fire(Tr("act.kick"), func() error { return v.app.Kick(c.Target) })
-	case CmdUnban:
-		v.fire(Tr("act.unban"), func() error { return v.app.Unban(c.Target) })
-	case CmdPerms:
-		v.fire(Tr("act.perms"), func() error { return v.app.SetPerms(c.Target, c.Perms) })
-	case CmdGrantAdmin:
-		v.fire(Tr("act.grantAdmin"), func() error { return v.app.GrantAdmin(c.Target) })
-	case CmdRevokeAdmin:
-		v.fire(Tr("act.revokeAdmin"), func() error { return v.app.RevokeAdmin(c.Target) })
-	case CmdTransfer:
-		v.fire(Tr("act.transfer"), func() error { return v.app.Transfer(c.Target) })
-	case CmdApprove:
-		v.fire(Tr("act.endorsed"), func() error { return v.app.ApproveTransfer(c.MsgID) })
-	case CmdDeny:
-		if v.app == nil {
-			return
-		}
-		if err := v.app.RejectTransfer(c.MsgID); err != nil {
-			v.setStatus(Tf("st.denyFail", err))
-			return
-		}
-		v.appendChat(chatLine{text: Tf("act.deniedLine", truncate(c.MsgID, 10)), system: true})
-		v.reloadTransfers()
-	case CmdTransfers:
-		v.listTransfers()
-	case CmdProgress:
-		// v18/v22：双轨进度以系统行展示，绝不作为发言广播。
-		for _, l := range ProgressLines() {
-			v.appendChat(chatLine{text: l, system: true})
-		}
-		v.setStatus(Tr("st.progressShown"))
-	case CmdOfflineAfter:
-		v.fire(Tr("act.presence"), func() error { return v.app.SetOfflineAfter(c.Millis) })
-	case CmdSeedCheck:
-		v.seedCheck(c.Path, core.PubKey{})
-	case CmdNetdisk, CmdNDStatus:
-		v.setPanel(PanelNetdisk)
-	case CmdNDUpload:
-		v.ndFire(func(nd Netdisk) error { return nd.Upload(c.Path) }, Tf("act.upload", c.Path))
-	case CmdNDDownload:
-		v.ndFire(func(nd Netdisk) error { return nd.Download(c.Name, c.Name) }, Tf("act.download", c.Name))
-	case CmdNDDelete:
-		v.ndFire(func(nd Netdisk) error { return nd.Delete(c.Name) }, Tf("act.delete", c.Name))
-	case CmdNDSet:
-		v.fire(Tf("act.ndQuota", c.MB), func() error { return v.app.SetNetdiskMB(c.MB) })
-	}
-}
-
-func (v *viewModel) listTransfers() {
-	if v.app == nil {
-		return
-	}
-	app := v.app
-	v.async(func() []Event {
-		props := app.PendingTransfers()
-		if len(props) == 0 {
-			return []Event{SystemEvent{Note: Tr("lf.none")}}
-		}
-		now := v.currentTime()
-		var b strings.Builder
-		fmt.Fprintf(&b, "%s\n", Tf("lf.title", len(props)))
-		for _, p := range props {
-			b.WriteString("  " + FormatTransferLine(p, now) + "\n")
-		}
-		b.WriteString(Tr("lf.hint"))
-		return []Event{SystemEvent{Note: strings.TrimRight(b.String(), "\n")}}
-	})
-}
+// ---- 宿主动作的共用出口 ----
 
 func (v *viewModel) audit() {
 	if v.app == nil {
@@ -808,34 +722,23 @@ func (v *viewModel) outboundDraft(text string) core.Message {
 	return core.Message{Sender: self, TSms: v.currentTime().UnixMilli(), Type: core.TypeText, Content: []byte(text)}
 }
 
-// ---- 面板动作（列表焦点下的可打印键）----
+// ---- 面板行数与行语义 ----
 
 // panelRows 是当前面板可选行数。
 func (v *viewModel) panelRows() int {
 	switch v.panel {
+	case PanelChat:
+		return v.VisibleChat()
 	case PanelMembers:
 		return len(v.members)
 	case PanelJoin:
 		return len(v.joinReqs)
 	case PanelAdmin:
 		return len(v.members) + len(v.banned) + len(v.transfers) + len(v.appeals)
+	case PanelNetdisk:
+		return len(v.ndFiles)
 	default:
 		return 0
-	}
-}
-
-func (v *viewModel) panelAction(key string) {
-	switch v.panel {
-	case PanelJoin:
-		v.joinAction(key)
-	case PanelAdmin:
-		v.adminAction(key)
-	case PanelNetdisk:
-		if key == "r" {
-			v.refreshNetdisk()
-		}
-	case PanelMembers:
-		// 成员面板只读展示（旧模型亦无动作）；j/k 导航由 OnKey 处理。
 	}
 }
 
@@ -850,6 +753,8 @@ func (v *viewModel) adminSec() adminSections {
 func (s adminSections) rowKind(sel int) string {
 	i := sel
 	switch {
+	case i < 0:
+		return ""
 	case i < s.m:
 		return "member"
 	case i < s.m+s.b:
@@ -860,146 +765,6 @@ func (s adminSections) rowKind(sel int) string {
 		return "appeal"
 	}
 	return ""
-}
-
-// ---- 入群面板动作（join_req 节）----
-
-func (v *viewModel) joinAction(key string) {
-	// 队列宿主所有（PendingJoins 是唯一事实源）：动作前先 reload，否则
-	// 种子核对通过后（宿主把 SeedOK 翻转为 true）面板仍拿着旧的本地副本，
-	// 「核对通过才准签 join」的门控会永久卡住批准。
-	v.reloadJoins()
-	if v.sel >= len(v.joinReqs) || v.app == nil {
-		return
-	}
-	req := v.joinReqs[v.sel]
-	switch key {
-	case "a": // 核对通过后签 join 广播
-		if !req.SeedOK {
-			v.setStatus(Tf("st.seedGate", ShortID(req.Msg.Sender)))
-			return
-		}
-		v.fire(Tr("act.joinSigned"), func() error { return v.app.ApproveJoin(req.Msg.MsgID) })
-	case "d": // 拒绝（仅本地出队，不广播）
-		if err := v.app.RejectJoin(req.Msg.MsgID); err != nil {
-			v.setStatus(Tf("st.rejectFail", err))
-		} else {
-			v.reloadJoins()
-		}
-	case "s": // 核对种子文件哈希（申请人递交或线下拿到的种子路径）
-		v.prompt = &promptState{label: Tr("prompt.seedPath"), action: "seedcheck", target: req.Msg.Sender}
-	case "r":
-		v.reloadJoins()
-	}
-}
-
-// ---- 群管面板动作（members/banned/transfers/appeals 四节）----
-
-func (v *viewModel) adminAction(key string) {
-	v.refreshRoster() // 行区间随宿主快照浮动，先对齐
-	v.reloadTransfers()
-	if key == "r" {
-		v.setPanel(PanelAdmin) // 重进即刷新
-		return
-	}
-	sec := v.adminSec()
-	kind := sec.rowKind(v.sel)
-	if v.app == nil {
-		return
-	}
-	switch {
-	case key == "K" && kind == "member":
-		pub := v.members[v.sel].Entry.Pub
-		v.fire(Tr("act.kickEvent"), func() error { return v.app.Kick(pub) })
-	case key == "U" && kind == "banned":
-		pub := v.banned[v.sel-sec.m].Pub
-		v.fire(Tr("act.unbanEvent"), func() error { return v.app.Unban(pub) })
-	case key == "P" && kind == "member":
-		pub := v.members[v.sel].Entry.Pub
-		v.prompt = &promptState{label: Tf("prompt.permsFor", ShortID(pub)), action: "perms", target: pub}
-	case key == "G" && kind == "member":
-		pub := v.members[v.sel].Entry.Pub
-		v.fire(Tr("act.grantAdminEvent"), func() error { return v.app.GrantAdmin(pub) })
-	case key == "R" && kind == "member":
-		pub := v.members[v.sel].Entry.Pub
-		v.fire(Tr("act.revokeAdminEvent"), func() error { return v.app.RevokeAdmin(pub) })
-	case key == "T" && kind == "member":
-		pub := v.members[v.sel].Entry.Pub
-		v.fire(Tr("act.transfer"), func() error { return v.app.Transfer(pub) })
-	case key == "a" && kind == "transfer":
-		v.transferAction(v.transfers[v.sel-sec.m-sec.b])
-	case key == "d" && kind == "transfer":
-		v.denyTransfer(v.transfers[v.sel-sec.m-sec.b])
-	case key == "u" && kind == "appeal":
-		msg := v.appeals[v.sel-sec.m-sec.b-sec.t]
-		v.fire(Tr("act.unbanEvent"), func() error { return v.app.Unban(msg.Sender) })
-	case key == "i" && kind == "appeal":
-		i := v.sel - sec.m - sec.b - sec.t
-		v.appeals = append(v.appeals[:i:i], v.appeals[i+1:]...)
-		v.setStatus(Tr("st.appealIgnored"))
-		v.moveSel(0)
-	}
-}
-
-// transferAction 批准 transfer 提案（v17①）：对本机收到的同一份原文补上
-// 联署（EndorseSig）并广播生效；签名者非现任 owner/创建者时拒绝联署。
-func (v *viewModel) transferAction(prop TransferProposal) {
-	if !prop.FromOwner {
-		v.setStatus(Tr("st.notOwner"))
-		return
-	}
-	v.fire(Tr("act.endorsed"), func() error { return v.app.ApproveTransfer(prop.Msg.MsgID) })
-}
-
-// denyTransfer 拒绝提案：宿主仅本地丢弃，绝不转发、不产生任何事件。
-func (v *viewModel) denyTransfer(prop TransferProposal) {
-	if err := v.app.RejectTransfer(prop.Msg.MsgID); err != nil {
-		v.setStatus(Tf("st.denyFail", err))
-		return
-	}
-	v.appendChat(chatLine{text: Tf("act.deniedLine", truncate(prop.Msg.MsgID, 10)), system: true})
-	v.reloadTransfers()
-}
-
-// ---- 提示行（prompt）处理 ----
-
-func (v *viewModel) onPromptKey(k Key) {
-	p := v.prompt
-	switch k {
-	case KeyEnter:
-		v.prompt = nil
-		v.runPrompt(p)
-	case KeyEscape:
-		v.prompt = nil
-		v.setStatus(Tr("st.cancelled"))
-	case KeyBackspace:
-		r := []rune(p.value)
-		if len(r) > 0 {
-			p.value = string(r[:len(r)-1])
-		}
-	}
-}
-
-func (v *viewModel) runPrompt(p *promptState) {
-	val := strings.TrimSpace(p.value)
-	if val == "" {
-		v.setStatus(Tr("st.emptyCancelled"))
-		return
-	}
-	switch p.action {
-	case "seedcheck":
-		v.seedCheck(val, p.target)
-	case "perms":
-		perms, err := ParsePermList(val)
-		if err != nil {
-			v.setStatus(Tf("st.permsErr", err))
-			return
-		}
-		if v.app == nil {
-			return
-		}
-		v.fire(Tr("act.permsEvent"), func() error { return v.app.SetPerms(p.target, perms) })
-	}
 }
 
 // ---- 快照（Snapshot → game 绘制）----
@@ -1033,15 +798,12 @@ func TabLabels() []string {
 // ActiveTab 返回当前面板序号。
 func (v *viewModel) ActiveTab() int { return int(v.panel) }
 
-// InputLine 返回输入栏内容：prompt 优先，其次 "> "+input 与光标 rune 下标。
+// InputLine 返回聊天输入栏内容与光标；仅 chat 面板有文本载体（其余面板底部是动作条）。
 func (v *viewModel) InputLine() (text string, caret int, active bool) {
-	if v.prompt != nil {
-		return v.prompt.label + ": " + v.prompt.value, len([]rune(v.prompt.label + ": " + v.prompt.value)), true
+	if v.panel != PanelChat {
+		return "", 0, false
 	}
-	if v.panel == PanelChat || v.inputFocus {
-		return "> " + string(v.input), v.cur + 2, true
-	}
-	return Tf("input.listFocus", "> "+string(v.input)), v.cur + 2, false
+	return "> " + string(v.input), v.cur + 2, true
 }
 
 // StatusLine 返回底部状态行。
@@ -1080,8 +842,11 @@ func (v *viewModel) Snapshot() []ViewLine {
 	return nil
 }
 
+// chatSnapshot 的 Row 与 chatLineAt 共用一套计数（跳过 hidden、含系统行），
+// 保证「右键命中哪条气泡就选中哪条」。
 func (v *viewModel) chatSnapshot() []ViewLine {
 	out := make([]ViewLine, 0, len(v.chat))
+	vis := 0
 	for _, l := range v.chat {
 		if l.hidden {
 			continue
@@ -1097,7 +862,13 @@ func (v *viewModel) chatSnapshot() []ViewLine {
 		if !l.sender.IsZero() {
 			avatar = ShortID(l.sender)
 		}
-		out = append(out, ViewLine{Text: l.text, Meta: l.meta, Body: l.body, Avatar: avatar, Style: st})
+		row := 0
+		if !l.system {
+			row = vis + 1
+		}
+		out = append(out, ViewLine{Text: l.text, Meta: l.meta, Body: l.body, Avatar: avatar,
+			Style: st, Selected: row > 0 && vis == v.sel, Row: row})
+		vis++
 	}
 	return out
 }
@@ -1110,7 +881,7 @@ func (v *viewModel) membersSnapshot() []ViewLine {
 		return out
 	}
 	for i, l := range RenderMemberLines(v.members, v.currentTime()) {
-		out = append(out, ViewLine{Text: l, Style: memberLineStyle(v.members[i]), Selected: i == v.sel})
+		out = append(out, ViewLine{Text: l, Style: memberLineStyle(v.members[i]), Selected: i == v.sel, Row: i + 1})
 	}
 	return out
 }
@@ -1119,17 +890,16 @@ func (v *viewModel) joinSnapshot() []ViewLine {
 	out := []ViewLine{{Text: Tr("p.join.header"), Style: StyleHeader}}
 	if len(v.joinReqs) == 0 {
 		out = append(out, ViewLine{Text: Tr("p.empty"), Style: StyleDim})
+		return out
 	}
 	for i, req := range v.joinReqs {
 		st := StyleChat
 		if req.SeedOK {
 			st = StyleOnline
 		}
-		out = append(out, ViewLine{Text: FormatJoinLine(req, v.currentTime()), Style: st, Selected: i == v.sel})
+		out = append(out, ViewLine{Text: FormatJoinLine(req, v.currentTime()), Style: st, Selected: i == v.sel, Row: i + 1})
 	}
-	if len(v.joinReqs) > 0 {
-		out = append(out, ViewLine{Text: Tr("p.join.hint"), Style: StyleDim})
-	}
+	out = append(out, ViewLine{Text: Tr("p.join.hint"), Style: StyleDim})
 	return out
 }
 
@@ -1139,11 +909,11 @@ func (v *viewModel) adminSnapshot() []ViewLine {
 	sec := v.adminSec()
 	out := []ViewLine{{Text: Tr("p.admin.members"), Style: StyleHeader}}
 	for i, l := range RenderMemberLines(v.members, v.currentTime()) {
-		out = append(out, ViewLine{Text: l, Style: memberLineStyle(v.members[i]), Selected: i == v.sel})
+		out = append(out, ViewLine{Text: l, Style: memberLineStyle(v.members[i]), Selected: i == v.sel, Row: i + 1})
 	}
 	out = append(out, ViewLine{Text: Tr("p.admin.banned"), Style: StyleBad})
 	for i, l := range RenderBannedLines(v.banned, v.currentTime(), false) {
-		out = append(out, ViewLine{Text: l, Style: StyleBad, Selected: sec.m+i == v.sel})
+		out = append(out, ViewLine{Text: l, Style: StyleBad, Selected: sec.m+i == v.sel, Row: sec.m + i + 1})
 	}
 	// transfer 联署提案节（v17①，v19 起落在群管面板）。
 	out = append(out, ViewLine{Text: Tr("p.admin.xfers"), Style: StyleHeader})
@@ -1155,10 +925,7 @@ func (v *viewModel) adminSnapshot() []ViewLine {
 		if prop.FromOwner {
 			st = StyleOnline
 		}
-		out = append(out, ViewLine{Text: FormatTransferLine(prop, v.currentTime()), Style: st, Selected: sec.m+sec.b+i == v.sel})
-	}
-	if len(v.transfers) > 0 {
-		out = append(out, ViewLine{Text: Tr("p.admin.xferHint"), Style: StyleDim})
+		out = append(out, ViewLine{Text: FormatTransferLine(prop, v.currentTime()), Style: st, Selected: sec.m+sec.b+i == v.sel, Row: sec.m + sec.b + i + 1})
 	}
 	// 黑名单定向申诉节。
 	out = append(out, ViewLine{Text: Tr("p.admin.appeals"), Style: StyleHeader})
@@ -1166,27 +933,34 @@ func (v *viewModel) adminSnapshot() []ViewLine {
 		out = append(out, ViewLine{Text: Tr("p.none"), Style: StyleDim})
 	}
 	for i, a := range v.appeals {
-		out = append(out, ViewLine{Text: FormatChatLine(a), Style: StyleChat, Selected: sec.m+sec.b+sec.t+i == v.sel})
+		out = append(out, ViewLine{Text: FormatChatLine(a), Style: StyleChat, Selected: sec.m+sec.b+sec.t+i == v.sel, Row: sec.m + sec.b + sec.t + i + 1})
 	}
 	return out
 }
 
+// netdiskSnapshot 顶部是总览小字（不可选），文件列表按 sel 高亮并给出 Row，
+// 使「下载/删除」作用于选中的那个文件。
 func (v *viewModel) netdiskSnapshot() []ViewLine {
 	v.refreshNetdisk()
 	if v.ndStatus == nil {
-		return []ViewLine{
-			{Text: Tr("p.nd.off"), Style: StyleHeader},
-		}
+		return []ViewLine{{Text: Tr("p.nd.off"), Style: StyleHeader}}
 	}
 	out := []ViewLine{{Text: Tr("p.nd.header"), Style: StyleHeader}}
-	for _, l := range RenderNetdiskLines(*v.ndStatus, v.ndFiles) {
+	for _, l := range RenderNetdiskStatusLines(*v.ndStatus) {
+		out = append(out, ViewLine{Text: l, Style: StyleChat})
+	}
+	out = append(out, ViewLine{Text: Tr("p.nd.files"), Style: StyleHeader})
+	if len(v.ndFiles) == 0 {
+		out = append(out, ViewLine{Text: Tr("p.empty"), Style: StyleDim})
+		return out
+	}
+	for i, l := range RenderNetdiskFileLines(v.ndFiles) {
 		st := StyleChat
 		if strings.HasPrefix(l, "!") || strings.HasPrefix(l, "！") {
 			st = StyleBad
 		}
-		out = append(out, ViewLine{Text: l, Style: st})
+		out = append(out, ViewLine{Text: l, Style: st, Selected: i == v.sel, Row: i + 1})
 	}
-	out = append(out, ViewLine{Text: Tr("p.nd.cmds"), Style: StyleDim})
 	return out
 }
 
@@ -1203,6 +977,9 @@ func (v *viewModel) VisibleChat() int {
 
 // ChatScroll 返回当前距底部的滚动偏移。
 func (v *viewModel) ChatScroll() int { return v.chatScroll }
+
+// SelectedRow 返回当前选中行序号（game 高亮与菜单定位用）。
+func (v *viewModel) SelectedRow() int { return v.sel }
 
 // SetBodyHeight 由 game 回填可视行数（夹取滚动 + 渲染窗口）。
 func (v *viewModel) SetBodyHeight(h int) {

@@ -11,12 +11,14 @@ import (
 
 // netdiskEvent 是 TypeNetdisk 群配置事件的原文载荷（core.CanonicalJSON 编码，
 // 即 core.Message.Content 与 proof.Raw 的那份字节）。
+//
+// 字段名必须与 group.eventNetdisk（真正落名单的那份解码结构）逐字一致：
+// 事件类型已在消息信封的 type 字段里，正文不再夹带 kind 判别位——早先这里
+// 多写了一个 kind、且把配额写成 netdisk_mb，group 侧严格解码直接判
+// 「unknown field "kind"」，于是改配额永远不生效（v25 实测踩到）。
 type netdiskEvent struct {
-	Kind      string `json:"kind"`
-	NetdiskMB int    `json:"netdisk_mb"`
+	MB int `json:"mb"`
 }
-
-const netdiskEventKind = "netdisk_config"
 
 // NetdiskEventContent 生成 netdisk 群配置事件的 Content 字节。
 // 配额越界（<0 或 >core.NetdiskMaxMB）直接拒绝（PLAN v14：越界事件验证直接拒绝）。
@@ -25,7 +27,7 @@ func NetdiskEventContent(mb int) ([]byte, error) {
 	if !core.ValidNetdiskMB(mb) {
 		return nil, fmt.Errorf("%w: %d (0..%d)", ErrBadQuotaMB, mb, core.NetdiskMaxMB)
 	}
-	return core.CanonicalJSON(netdiskEvent{Kind: netdiskEventKind, NetdiskMB: mb})
+	return core.CanonicalJSON(netdiskEvent{MB: mb})
 }
 
 // ValidateNetdiskContent 复验一条 TypeNetdisk 事件内容，返回新配额值。
@@ -43,21 +45,18 @@ func ValidateNetdiskContent(content []byte) (int, error) {
 	if dec.More() {
 		return 0, fmt.Errorf("%w: trailing content", ErrBadQuotaMB)
 	}
-	if ev.Kind != netdiskEventKind {
-		return 0, fmt.Errorf("%w: event kind %q", ErrBadQuotaMB, ev.Kind)
-	}
-	if !core.ValidNetdiskMB(ev.NetdiskMB) {
-		return 0, fmt.Errorf("%w: %d", ErrBadQuotaMB, ev.NetdiskMB)
+	if !core.ValidNetdiskMB(ev.MB) {
+		return 0, fmt.Errorf("%w: %d", ErrBadQuotaMB, ev.MB)
 	}
 	// 签名原文必须与此重编码逐字节一致（防原文/值分离伪装）。
-	want, err := NetdiskEventContent(ev.NetdiskMB)
+	want, err := NetdiskEventContent(ev.MB)
 	if err != nil {
 		return 0, err
 	}
 	if !bytes.Equal(want, content) {
 		return 0, fmt.Errorf("%w: content not canonical", ErrBadQuotaMB)
 	}
-	return ev.NetdiskMB, nil
+	return ev.MB, nil
 }
 
 // MakeNetdiskEvent 由 signer（群主/创建者）签发一条 netdisk 群配置事件消息，

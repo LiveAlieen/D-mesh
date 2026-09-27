@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dmesh/internal/core"
+	"dmesh/internal/netdisk"
 )
 
 // --- presence -----------------------------------------------------------------
@@ -106,6 +107,25 @@ func TestNetdiskBoundsAndAuthority(t *testing.T) {
 	e.mustApply(e.ev(e.creat, core.TypePerms, eventPerms{Target: alice.Pub(),
 		Perms: []string{core.PermSpeak, core.PermReceive, core.PermNetdisk}}, base+20))
 	e.wantErr(e.ev(alice, core.TypeNetdisk, eventNetdisk{MB: 5}, base+21), core.ErrNotPermitted)
+}
+
+// TestNetdiskQuotaEventWireContract 钉住跨包字节契约：internal/netdisk 签发的配额
+// 事件正文必须能被本包的严格解码器吃下并真正改到群配置。曾因生产端多写一个 kind、
+// 字段名写成 netdisk_mb，本包判 unknown field，「改配额」在全网永远不生效（v25 实测）。
+func TestNetdiskQuotaEventWireContract(t *testing.T) {
+	e := newEnv(t, Options{})
+	content, err := netdisk.NetdiskEventContent(9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := core.Message{Type: core.TypeNetdisk, TSms: e.now + 1, Content: content}
+	if err := SignEvent(&m, e.creat, e.gid); err != nil {
+		t.Fatal(err)
+	}
+	e.mustApply(m)
+	if got := e.r.NetdiskMB(); got != 9 {
+		t.Fatalf("NetdiskMB = %d, want 9（生产端与解码端字段契约不一致）", got)
+	}
 }
 
 // --- join_req 收件箱 ------------------------------------------------------------

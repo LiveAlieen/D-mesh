@@ -103,6 +103,14 @@ type App interface {
 	NextEvent() Event
 }
 
+// TextIDAck 是 App 的可选扩展（v25）：宿主发送文本后回报落盘的真实 msg_id。
+// GUI 的「隐藏本条」只能针对本机自己发的那条，而 msg_id 由宿主签名时才产生，
+// 因此实现本接口的宿主能让回显行立刻可隐藏；未实现时回退 SendText，自己发的
+// 消息只支持「复制正文」。协议与事件面不受影响（纯 UI 侧回执通道）。
+type TextIDAck interface {
+	SendTextID(text string) (msgID string, err error)
+}
+
 // JoinRequest 是一条待处理的入群申请（宿主从 join_req 事件解码后的呈现形态）。
 type JoinRequest struct {
 	// Msg 是原始 join_req 消息（申请人自签；MsgID 用于 Approve/Reject 定位）。

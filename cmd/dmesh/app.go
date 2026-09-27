@@ -28,6 +28,9 @@ func (n *node) GroupID() [32]byte { return n.gid }
 
 func (n *node) SendText(text string) error { return n.sendText(text) }
 
+// SendTextID 实现 ui.TextIDAck（v25）：发送并回报签名落盘后的 msg_id。
+func (n *node) SendTextID(text string) (string, error) { return n.sendTextID(text) }
+
 // Hide 对目标 msg_id 发 hide 事件（须与原文同 pubkey；引擎/存储软删除）。
 func (n *node) Hide(msgID string) error {
 	tgt, ok, err := n.st.GetMessage(msgID)

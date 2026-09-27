@@ -36,17 +36,17 @@ func TestNetdiskConfigEvent(t *testing.T) {
 		if _, err := MakeNetdiskEvent(owner, gid, mb, 1); !errors.Is(err, ErrBadQuotaMB) {
 			t.Fatalf("mb=%d must be rejected at signing, got %v", mb, err)
 		}
-		content, _ := json.Marshal(map[string]any{"kind": "netdisk_config", "netdisk_mb": mb})
+		content, _ := json.Marshal(map[string]any{"mb": mb})
 		if _, err := ValidateNetdiskContent(content); !errors.Is(err, ErrBadQuotaMB) {
 			t.Fatalf("mb=%d must be rejected at validation, got %v", mb, err)
 		}
 	}
-	// 非 canonical / 未知 kind / 畸形 JSON 全部拒绝。
-	if _, err := ValidateNetdiskContent([]byte(`{ "netdisk_mb" : 5, "kind": "netdisk_config" }`)); !errors.Is(err, ErrBadQuotaMB) {
+	// 非 canonical / 夹带多余字段 / 畸形 JSON 全部拒绝。
+	if _, err := ValidateNetdiskContent([]byte(`{ "mb" : 5 }`)); !errors.Is(err, ErrBadQuotaMB) {
 		t.Fatalf("non-canonical content must be rejected, got %v", err)
 	}
-	if _, err := ValidateNetdiskContent([]byte(`{"kind":"other","netdisk_mb":5}`)); !errors.Is(err, ErrBadQuotaMB) {
-		t.Fatalf("wrong kind must be rejected, got %v", err)
+	if _, err := ValidateNetdiskContent([]byte(`{"kind":"netdisk_config","mb":5}`)); !errors.Is(err, ErrBadQuotaMB) {
+		t.Fatalf("extra field must be rejected, got %v", err)
 	}
 	if _, err := ValidateNetdiskContent([]byte(`not json`)); !errors.Is(err, ErrBadQuotaMB) {
 		t.Fatalf("garbage must be rejected, got %v", err)

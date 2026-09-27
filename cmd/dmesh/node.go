@@ -483,28 +483,31 @@ func (n *node) signAndPublish(typ string, content any, tsMS int64) error {
 
 // sendText 发送一条聊天消息，并顺带推进本人在场（v13：任何消息自带发送时间戳，
 // 这里以配套 presence 事件把 last_msg_ts 分发给全员）。
-func (n *node) sendText(text string) error {
+func (n *node) sendText(text string) error { _, err := n.sendTextID(text); return err }
+
+// sendTextID 同 sendText，额外回报签名后落盘的 msg_id（GUI「隐藏本条」需要，v25）。
+func (n *node) sendTextID(text string) (string, error) {
 	if n.roster.TierOf(n.self) < 0 {
-		return fmt.Errorf("%w: 本机还不是群成员（等待拉人者签 join）", core.ErrNotPermitted)
+		return "", fmt.Errorf("%w: 本机还不是群成员（等待拉人者签 join）", core.ErrNotPermitted)
 	}
 	if !n.roster.HasPerm(n.self, core.PermSpeak) {
-		return fmt.Errorf("%w: 无 speak 权限", core.ErrNotPermitted)
+		return "", fmt.Errorf("%w: 无 speak 权限", core.ErrNotPermitted)
 	}
 	if !n.chatLim.Allow("self") {
-		return fmt.Errorf("本机发送过快，稍后再试")
+		return "", fmt.Errorf("本机发送过快，稍后再试")
 	}
 	ts := n.now()
 	m := core.Message{Type: core.TypeText, Content: []byte(text), TSms: ts}
 	signed, err := message.NewMessage(n.id, n.gid, &m, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	n.persist(signed)
 	if _, err := n.engine.Publish(signed); err != nil {
-		return err
+		return "", err
 	}
 	n.setLastSelf(ts)
-	return n.publishPresence(ts)
+	return signed.MsgID, n.publishPresence(ts)
 }
 
 // publishPresence 本人自签在场报告（max 合并；offline_after 随报告分发，v13.1）。
