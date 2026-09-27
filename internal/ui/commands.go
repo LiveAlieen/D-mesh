@@ -40,7 +40,21 @@ const (
 	CmdNDSet        // /netdisk set <MB> 签 netdisk 事件改配额
 	CmdLang         // /lang <code> 切换界面语言（v20；v21 起语言集合由语言文件驱动，仅 GUI 生效）
 	CmdTheme        // /theme [light|dark] 查询/切换配色主题（v23，仅 GUI 生效）
+	CmdJoinApprove  // /join approve [msg_id|latest|唯一前缀] 批准入群申请（v27 无头调试）
+	CmdJoinReject   // /join reject [msg_id|latest|唯一前缀] 拒绝入群申请（v27）
+	CmdMembers      // /members 列出双名单与在场（v27 只读回报）
 )
+
+// allCmdKinds 列出全部命令类别（v27 两侧可达性契约测试用：
+// 每类命令必须在无头控制台里有归属——动作、只读回报或明确的 GUI-only）。
+var allCmdKinds = []CmdKind{
+	CmdText, CmdHelp, CmdClear, CmdQuit, CmdHide, CmdAudit, CmdRemove, CmdKick,
+	CmdUnban, CmdPerms, CmdGrantAdmin, CmdRevokeAdmin, CmdTransfer, CmdApprove,
+	CmdDeny, CmdTransfers, CmdProgress, CmdOfflineAfter, CmdSeedCheck,
+	CmdNetdisk, CmdNDStatus, CmdNDUpload, CmdNDDownload, CmdNDDelete, CmdNDSet,
+	CmdLang, CmdTheme,
+	CmdJoinApprove, CmdJoinReject, CmdMembers,
+}
 
 // Command 是解析结果：Kind + 按类别有效的参数字段。
 type Command struct {
@@ -127,6 +141,22 @@ func ParseCommand(line string) (Command, error) {
 		return Command{Kind: CmdSeedCheck, Path: rest}, nil
 	case "netdisk", "nd":
 		return parseNetdisk(s, rest)
+	case "join":
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return Command{}, fmt.Errorf("usage: /join <approve|reject> [msg_id|latest|唯一前缀]")
+		}
+		id := strings.Join(fields[1:], " ")
+		switch strings.ToLower(fields[0]) {
+		case "approve", "yes", "accept":
+			return Command{Kind: CmdJoinApprove, MsgID: id}, nil
+		case "reject", "no", "deny":
+			return Command{Kind: CmdJoinReject, MsgID: id}, nil
+		default:
+			return Command{}, fmt.Errorf("unknown /join subcommand %q", fields[0])
+		}
+	case "members", "roster":
+		return Command{Kind: CmdMembers}, nil
 	case "lang":
 		return Command{Kind: CmdLang, Lang: strings.ToLower(rest)}, nil
 	case "theme":
@@ -256,6 +286,14 @@ func parseNetdisk(full, rest string) (Command, error) {
 			return Command{}, fmt.Errorf("usage: /netdisk download <name>")
 		}
 		return Command{Kind: CmdNDDownload, Name: arg}, nil
+	case "save":
+		// /netdisk save <name> <dest>：下载并显式指定落盘路径（无头脚本/E2E 用，
+		// 与 GUI 的「下载」共用同一 ActNDDownload，只是把 dest 从命令行给进来）。
+		f2 := strings.Fields(rest)
+		if len(f2) < 3 {
+			return Command{}, fmt.Errorf("usage: /netdisk save <name> <dest>")
+		}
+		return Command{Kind: CmdNDDownload, Name: f2[1], Path: strings.Join(f2[2:], " ")}, nil
 	case "delete", "rm":
 		if arg == "" {
 			return Command{}, fmt.Errorf("usage: /netdisk delete <name>")

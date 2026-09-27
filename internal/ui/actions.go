@@ -63,6 +63,20 @@ const (
 	ActRefresh ActionID = "refresh"
 )
 
+// allActionIDs 列出全部动作 ID（v27 两侧可达性契约测试用：
+// 每个动作要么 GUI 有控件、要么无头可触发，两边都够不着即测试红）。
+// 加动作必须同时登记到这里，否则 const 与表漂移。
+var allActionIDs = []ActionID{
+	ActHelp, ActAudit, ActSettings, ActLeave, ActQuit,
+	ActTheme, ActLang, ActOfflineTune,
+	ActSend, ActClear, ActHide, ActCopy,
+	ActKick, ActUnban, ActPerms, ActGrant, ActRevoke, ActTransfer, ActCopyPub,
+	ActJoinApprove, ActJoinReject, ActSeedCheck,
+	ActXferApprove, ActXferDeny, ActAppealUnban, ActAppealIgnore,
+	ActNDUpload, ActNDDownload, ActNDDelete, ActNDQuota,
+	ActRefresh,
+}
+
 // Action 是一个可点击的动作。Enabled=false 时置灰显示（不隐藏：让用户看得见能力面）。
 type Action struct {
 	ID      ActionID
@@ -307,6 +321,7 @@ func (v *viewModel) RunAction(id ActionID) {
 type actionCtx struct {
 	pub     core.PubKey
 	msgID   string
+	text    string   // v27：无头通道的聊天正文（GUI 由输入栏供给）
 	path    string   // 文件选择框/手输路径的结果
 	name    string   // 网盘文件名
 	perms   []string // 勾选框结果
@@ -367,7 +382,12 @@ func (v *viewModel) exec(id ActionID, c actionCtx) {
 	case ActLeave:
 		v.fire(Tr("act.leave"), func() error { return v.app.Leave() })
 	case ActSend:
-		v.sendText(strings.TrimSpace(string(v.input)))
+		// 正文优先取输入栏（GUI），无头通道没有输入栏，退到动作上下文。
+		text := strings.TrimSpace(string(v.input))
+		if text == "" {
+			text = strings.TrimSpace(c.text)
+		}
+		v.sendText(text)
 	case ActHide:
 		if c.msgID == "" {
 			return
@@ -428,7 +448,13 @@ func (v *viewModel) exec(id ActionID, c actionCtx) {
 		if c.name == "" {
 			return
 		}
-		v.ndFire(func(nd Netdisk) error { return nd.Download(c.name, c.name) }, Tf("act.download", c.name))
+		// c.path 非空=显式落盘目标（无头 `/netdisk save <name> <dest>`）；
+		// 空则沿用 GUI 的「按原名落到当前目录」，GUI 行为零变化。
+		dest := c.path
+		if dest == "" {
+			dest = c.name
+		}
+		v.ndFire(func(nd Netdisk) error { return nd.Download(c.name, dest) }, Tf("act.download", c.name))
 	case ActNDDelete:
 		if c.name == "" {
 			return
@@ -451,7 +477,7 @@ func (v *viewModel) exec(id ActionID, c actionCtx) {
 		if SetTheme(c.theme) {
 			v.setStatus(Tf("st.themeSet", string(GetTheme())))
 		} else {
-			v.setStatus(Tf("st.themeBad", c.theme, ThemeList()))
+			v.failStatus(Tf("st.themeBad", c.theme, ThemeList()))
 		}
 	case ActLang:
 		if c.lang == "" {
@@ -460,7 +486,7 @@ func (v *viewModel) exec(id ActionID, c actionCtx) {
 		if SetLang(Lang(c.lang)) {
 			v.setStatus(Tf("st.langSet", string(GetLang())))
 		} else {
-			v.setStatus(Tf("st.langBad", c.lang, LangList()))
+			v.failStatus(Tf("st.langBad", c.lang, LangList()))
 		}
 	case ActRefresh:
 		v.setPanel(v.panel) // 重进即刷新（与旧 r 键同语义）
@@ -474,7 +500,7 @@ func (v *viewModel) approveJoin() {
 	}
 	req := v.joinReqs[v.sel]
 	if !req.SeedOK {
-		v.setStatus(Tf("st.seedGate", ShortID(req.Msg.Sender)))
+		v.failStatus(Tf("st.seedGate", ShortID(req.Msg.Sender)))
 		return
 	}
 	v.fire(Tr("act.joinSigned"), func() error { return v.app.ApproveJoin(req.Msg.MsgID) })
@@ -486,7 +512,7 @@ func (v *viewModel) rejectJoin() {
 		return
 	}
 	if err := v.app.RejectJoin(v.joinReqs[v.sel].Msg.MsgID); err != nil {
-		v.setStatus(Tf("st.rejectFail", err))
+		v.failStatus(Tf("st.rejectFail", err))
 		return
 	}
 	v.reloadJoins()
@@ -504,7 +530,7 @@ func (v *viewModel) endorseTransfer() {
 		return
 	}
 	if !v.transfers[i].FromOwner {
-		v.setStatus(Tr("st.notOwner"))
+		v.failStatus(Tr("st.notOwner"))
 		return
 	}
 	v.fire(Tr("act.endorsed"), func() error { return v.app.ApproveTransfer(v.transfers[i].Msg.MsgID) })
@@ -515,7 +541,7 @@ func (v *viewModel) denyTransferID(msgID string) {
 		return
 	}
 	if err := v.app.RejectTransfer(msgID); err != nil {
-		v.setStatus(Tf("st.denyFail", err))
+		v.failStatus(Tf("st.denyFail", err))
 		return
 	}
 	v.appendChat(chatLine{text: Tf("act.deniedLine", truncate(msgID, 10)), system: true})
@@ -528,7 +554,7 @@ func (v *viewModel) sendText(text string) {
 		return
 	}
 	if !v.hasPerm(core.PermSpeak) {
-		v.setStatus(Tr("st.noSpeak"))
+		v.failStatus(Tr("st.noSpeak"))
 		return
 	}
 	v.input, v.cur, v.sel = nil, 0, 0
@@ -545,12 +571,12 @@ func (v *viewModel) sendText(text string) {
 		if ack, ok := v.app.(TextIDAck); ok {
 			id, err := ack.SendTextID(text)
 			if err != nil {
-				return []Event{SystemEvent{Note: Tf("act.failed", desc, err)}}
+				return []Event{SystemEvent{Note: v.fail(Tf("act.failed", desc, err))}}
 			}
 			return []Event{chatIDEvent{seq: seq, msgID: id}, SystemEvent{Note: Tf("act.submitted", desc)}}
 		}
 		if err := v.app.SendText(text); err != nil {
-			return []Event{SystemEvent{Note: Tf("act.failed", desc, err)}}
+			return []Event{SystemEvent{Note: v.fail(Tf("act.failed", desc, err))}}
 		}
 		return []Event{SystemEvent{Note: Tf("act.submitted", desc)}}
 	})

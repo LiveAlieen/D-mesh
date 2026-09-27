@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -859,10 +860,14 @@ func (n *node) pendingTransfersLocked() []ui.TransferProposal {
 	return out
 }
 
-// headlessCommands 无头模式的 stdin 脚本通道：普通行=发言，"/…" 复用 ui 的
-// 命令解析器派发到 ui.App 宿主方法（v17：transfer/approve 可脚本化，也供
-// E2E 联调）。不支持的交互命令给出提示而非静默丢弃。
+// headlessCommands 无头命令通道（v27）：一行输入交给 ui.Console，后者把命令
+// 翻译成 GUI 动作表里的同一个 ActionID 并执行同一个 exec——无头不再自带一份
+// 业务调用，「GUI 能点、无头跑不了」的漂移由契约测试钉死。
+// 双轨输出：默认人类可读行（错误仍打 stderr "[cmd] <行>: <原因>"，lifecycle.sh
+// 的 grant 重试判据依赖它）；--json 时每条命令一行 JSON 对象，脚本按字段断言。
 func (n *node) headlessCommands(ctx context.Context) {
+	con := ui.NewConsole(n)
+	enc := json.NewEncoder(os.Stdout)
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 16<<10), 1<<20)
 	for sc.Scan() {
@@ -873,83 +878,36 @@ func (n *node) headlessCommands(ctx context.Context) {
 		if line == "" {
 			continue
 		}
-		if !strings.HasPrefix(line, "/") {
-			if err := n.SendText(line); err != nil {
-				fmt.Fprintf(os.Stderr, "[cmd] send: %v\n", err)
+		out := con.Run(line)
+		if n.o.jsonOut {
+			if err := enc.Encode(out); err != nil {
+				fmt.Fprintf(os.Stderr, "[cmd] json encode: %v\n", err)
 			}
-			continue
+		} else {
+			printCommandOut(out)
 		}
-		c, err := ui.ParseCommand(line)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[cmd] %v\n", err)
-			continue
-		}
-		switch c.Kind {
-		case ui.CmdText:
-			err = n.SendText(c.Text)
-		case ui.CmdTransfer:
-			err = n.Transfer(c.Target)
-		case ui.CmdApprove:
-			id := c.MsgID
-			if id == "" {
-				id = "latest"
-			}
-			err = n.ApproveTransfer(id)
-		case ui.CmdDeny:
-			id := c.MsgID
-			if id == "" {
-				id = "latest"
-			}
-			err = n.RejectTransfer(id)
-		case ui.CmdTransfers:
-			for _, p := range n.PendingTransfers() {
-				fmt.Fprintf(os.Stdout, "%s\n", ui.FormatTransferLine(p, time.Now()))
-			}
-		case ui.CmdProgress:
-			// v18/v22 双轨进度：stdout 系统输出，绝不进发言流。
-			for _, l := range ui.ProgressLines() {
-				fmt.Fprintf(os.Stdout, "[progress] %s\n", l)
-			}
-		case ui.CmdTheme:
-			// v23：headless 不装 saver（不读不写 ui_prefs.json），仅回显。
-			if c.Theme == "" {
-				fmt.Fprintf(os.Stdout, "[theme] %s (available: %s)\n", ui.GetTheme(), ui.ThemeList())
-			} else if ui.SetTheme(c.Theme) {
-				fmt.Fprintf(os.Stdout, "[theme] %s\n", ui.GetTheme())
-			} else {
-				fmt.Fprintf(os.Stderr, "[cmd] unknown theme %q (available: %s)\n", c.Theme, ui.ThemeList())
-			}
-		case ui.CmdKick:
-			err = n.Kick(c.Target)
-		case ui.CmdUnban:
-			err = n.Unban(c.Target)
-		case ui.CmdGrantAdmin:
-			err = n.GrantAdmin(c.Target)
-		case ui.CmdRevokeAdmin:
-			err = n.RevokeAdmin(c.Target)
-		case ui.CmdPerms:
-			err = n.SetPerms(c.Target, c.Perms)
-		case ui.CmdHide:
-			err = n.Hide(c.MsgID)
-		case ui.CmdRemove:
-			err = n.Leave()
-		case ui.CmdOfflineAfter:
-			err = n.SetOfflineAfter(c.Millis)
-		case ui.CmdAudit:
-			rows, aerr := n.Audit()
-			for _, r := range rows {
-				fmt.Fprintf(os.Stdout, "[audit] %s\n", r)
-			}
-			err = aerr
-		case ui.CmdQuit:
+		if out.Quit {
 			n.shutdown()
 			return
-		default:
-			fmt.Fprintf(os.Stderr, "[cmd] 该命令需 GUI 交互模式: %s\n", line)
 		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[cmd] %s: %v\n", line, err)
-		}
+	}
+}
+
+// reportPrefix 是人类可读轨里只读回报的行前缀（沿用 v26 之前的 [progress] 口径）。
+var reportPrefix = map[string]string{
+	"progress":  "[progress] ",
+	"members":   "[member] ",
+	"transfers": "[transfer] ",
+	"ndstatus":  "[netdisk] ",
+}
+
+func printCommandOut(out ui.Out) {
+	pre := reportPrefix[out.Kind]
+	for _, l := range out.Texts {
+		fmt.Fprintf(os.Stdout, "%s%s\n", pre, l)
+	}
+	if out.Err != "" {
+		fmt.Fprintf(os.Stderr, "[cmd] %s: %v\n", out.Line, out.Err)
 	}
 }
 

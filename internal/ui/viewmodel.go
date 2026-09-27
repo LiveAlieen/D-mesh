@@ -169,6 +169,10 @@ type viewModel struct {
 	// deliver 由 game 注入：在工作线程跑 job（读文件/审计/出站广播），产出的
 	// 事件回投 UI 线程应用。nil（单测/离线预览）时同步执行，结果立即可断言。
 	deliver func(job func() []Event)
+
+	// errSink 由无头控制台（console.go）注入：动作失败时把失败提示额外抄送一份，
+	// 使 --json 的 ok 字段不必靠猜本地化文本判定。GUI 从不置位 ⇒ 行为零变化。
+	errSink func(note string)
 }
 
 // newViewModel 构造根状态机。
@@ -278,6 +282,24 @@ func (v *viewModel) setStatus(f string, args ...any) {
 		f = fmt.Sprintf(f, args...)
 	}
 	v.status = f
+}
+
+// fail 原样返回一条失败提示，并抄送给 errSink（无头控制台的 ok 判定）。
+func (v *viewModel) fail(note string) string {
+	v.errSinkSet(note)
+	return note
+}
+
+// failStatus 置状态栏并抄送 errSink。
+func (v *viewModel) failStatus(f string, args ...any) {
+	v.setStatus(f, args...)
+	v.errSinkSet(v.status)
+}
+
+func (v *viewModel) errSinkSet(note string) {
+	if v.errSink != nil {
+		v.errSink(note)
+	}
 }
 
 func (v *viewModel) appendChat(l chatLine) {
@@ -618,7 +640,7 @@ func (v *viewModel) audit() {
 	v.async(func() []Event {
 		lines, err := app.Audit()
 		if err != nil {
-			return []Event{SystemEvent{Note: Tf("au.failed", err.Error())}}
+			return []Event{SystemEvent{Note: v.fail(Tf("au.failed", err.Error()))}}
 		}
 		evs := make([]Event, 0, len(lines))
 		for _, l := range lines {
@@ -649,7 +671,7 @@ func (v *viewModel) fire(desc string, job func() error) {
 	}
 	v.async(func() []Event {
 		if err := job(); err != nil {
-			return []Event{SystemEvent{Note: Tf("act.failed", desc, err)}}
+			return []Event{SystemEvent{Note: v.fail(Tf("act.failed", desc, err))}}
 		}
 		return []Event{SystemEvent{Note: Tf("act.submitted", desc)}}
 	})
@@ -659,7 +681,7 @@ func (v *viewModel) fire(desc string, job func() error) {
 func (v *viewModel) ndFire(fn func(Netdisk) error, desc string) {
 	nd := mustND(v.app)
 	if nd == nil {
-		v.setStatus(Tr("st.ndUnavailable"))
+		v.failStatus(Tr("st.ndUnavailable"))
 		return
 	}
 	v.fire(desc, func() error { return fn(nd) })

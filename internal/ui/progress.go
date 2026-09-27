@@ -40,6 +40,7 @@ var changelog = []versionNote{
 	{"v24", "主题文件化：调色板迁 JSON（go:embed 内嵌 + 外置 themes 目录可扩展）"},
 	{"v25", "操作全面 GUI 化：按钮/右键菜单/表单取代斜杠命令（无头 stdin 语义不变）"},
 	{"v26", "消息归一化：所有消息与命令统一为「时间+具体消息+签名」，具体消息分消息/命令/扩展三类（断代重来，零功能变更）"},
+	{"v27", "无头命令通道与 GUI 共用同一张动作表（/join、/members、/netdisk save 补齐），--json 机器可读双轨"},
 }
 
 type milestone struct {

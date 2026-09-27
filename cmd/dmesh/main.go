@@ -54,6 +54,7 @@ type opts struct {
 	heartbeat   time.Duration // --heartbeat presence 心跳周期
 	scope       string        // --backfill-scope incremental|all|recent|none
 	runFor      time.Duration // --run-for 到期干净退出（0=常驻；冒烟测试用）
+	jsonOut     bool          // --json 无头命令通道改出机器可读 JSON（每命令一行）
 }
 
 // stringList 支持重复 flag（--peer）。
@@ -90,6 +91,7 @@ func main() {
 	flag.DurationVar(&o.heartbeat, "heartbeat", 60*time.Second, "presence 心跳周期")
 	flag.StringVar(&o.scope, "backfill-scope", "incremental", "回灌范围 incremental|all|recent|none")
 	flag.DurationVar(&o.runFor, "run-for", 0, "运行该时长后干净退出（0=常驻，冒烟测试用）")
+	flag.BoolVar(&o.jsonOut, "json", false, "无头 stdin 命令通道输出机器可读 JSON（每命令一行，供 E2E 断言字段）")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: dmesh --data <dir> [--seed group.json] [--peer ip:port] [--no-ui] ...")
 		flag.PrintDefaults()
@@ -107,6 +109,11 @@ func main() {
 }
 
 func run(o *opts) error {
+	// --json 是机器可读轨道：脚本要的是行稳定的输出，绝不该弹出窗口。
+	if o.jsonOut {
+		o.noUI = true
+	}
+
 	// 0. 日志：GUI 模式写文件避免污染界面；无头模式走 stderr。
 	if err := os.MkdirAll(o.data, 0o700); err != nil {
 		return fmt.Errorf("mkdir --data: %w", err)
@@ -214,10 +221,11 @@ func run(o *opts) error {
 	if n.interactive {
 		err = n.runGUI()
 	} else {
-		go n.headlessCommands(ctx) // 无头脚本通道：每行文本=发言，"/…" 走 ui.ParseCommand
+		go n.headlessCommands(ctx) // 无头命令通道：与 GUI 共用一张动作表（v27）
 		select {
 		case <-ctx.Done():
 		case err = <-errCh:
+		case <-n.done: // /quit（或宿主自关）：shutdown 已 close(done)，此处必须同路退出
 		}
 	}
 	if err != nil {

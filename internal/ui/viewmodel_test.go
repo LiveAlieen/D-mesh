@@ -37,6 +37,8 @@ type fakeApp struct {
 	joins     []JoinRequest
 	transfers []TransferProposal
 	nd        Netdisk
+	// failNext 让下一个出站动作返回 error（v27：无头控制台据此置 ok=false）。
+	failNext bool
 }
 
 func (f *fakeApp) record(name string) { f.calls = append(f.calls, name) }
@@ -68,6 +70,10 @@ func (f *fakeApp) Hide(id string) error { f.record("Hide:" + id); return nil }
 func (f *fakeApp) Leave() error         { f.record("Leave"); return nil }
 func (f *fakeApp) Kick(t core.PubKey) error {
 	f.record("Kick:" + t.Key())
+	if f.failNext {
+		f.failNext = false
+		return fmt.Errorf("kick refused by host")
+	}
 	return nil
 }
 func (f *fakeApp) Unban(t core.PubKey) error {
@@ -166,7 +172,7 @@ func (n *fakeND) List() ([]NetdiskFile, error) {
 }
 func (n *fakeND) Upload(p string) error { n.calls = append(n.calls, "Upload:"+p); return nil }
 func (n *fakeND) Download(name, dest string) error {
-	n.calls = append(n.calls, "Download:"+name)
+	n.calls = append(n.calls, "Download:"+name+"→"+dest)
 	return nil
 }
 func (n *fakeND) Delete(name string) error { n.calls = append(n.calls, "Delete:"+name); return nil }

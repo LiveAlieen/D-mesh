@@ -130,6 +130,15 @@
 - 附带订正 `PLAN.md` 三处 v26 之后的旧措辞（「清单走独立控制帧」→ `ext/manifest` 正式消息；M6「约 1 天」粗估改为指向专项排期）。
 
 
+## v27 — 无头命令调试通道与 GUI 共用同一张动作表
+- **原话**：「改造当前gui以支持无头方式可用 命令调试」（2026-09-27）
+- **追问裁定**：① 路线 = 「B：共用 Action 注册表（推荐）」——无头命令与 GUI 控件共用**同一张动作权威**：窗口里能点的动作，无头 stdin 一律可达，并以契约测试钉死「今后新增动作只接一侧」不可能发生。② 输出 = 「文本 + 机器可读双轨（推荐）」——保留人类可读行，另加全局 `--json`：每条命令输出一个 JSON 对象，E2E 脚本按字段断言而不再 grep 散文。
+- 定稿（PLAN 条目 20）：新增 `internal/ui/console.go`——`Console` 持一个**不渲染的 `viewModel`**（`deliver==nil` ⇒ 作业同步跑完，无 goroutine 无窗口），命令行进 `ParseCommand`→`planFor`→**与 GUI 点击同一个 `exec`**；GUI 的对话框/鼠标选中在无头侧由命令行参数 + `pickID`（`latest`/精确/唯一前缀）替代，`prepare` 先向宿主重拉队列再把 `v.sel` 摆到指定那条并把 `latest` 归一化为具体 `msg_id`。补齐无头入口（都是既有动作，非新能力）：`/join approve|reject [id]`、`/members`（别名 `/roster`）、`/netdisk save <名> <落盘路径>`（原先只会写进 CWD）。`verifyArgs` 把 `exec` 里「缺参静默 no-op」的分支提前变成明确 error。**`ok` 判定不靠猜本地化文本**：`viewModel` 新增可选 `errSink`（只有 `NewConsole` 接线，GUI 永不置位 ⇒ 行为零影响），失败行与失败状态一律经 `v.fail`/`v.failStatus` 抄送。防漂移机制 = `TestBothSidesCoverEveryAction` **双向卡死**：`allActionIDs` 每项要么被 `planFor` 产出、要么在 `guiOnly` 登记非空理由；反向再遍历所有面板与选中行，校验每个动作确实在窗口控件面上出现。**协议层、事件面、`ui.App` 门面签名零改动**，v25「窗口内永不解析斜杠命令」铁律不破。
+- **落实记录（2026-09-27）**：`console.go`+`console_test.go` 落地，`cmd/dmesh/node.go` 的 `headlessCommands` 从 17 个 `case … n.XXX()` 直调改为 `ui.NewConsole(n)`+`con.Run(line)`（失败仍走 stderr `[cmd] <行>: <原因>`，只读回报保留 `[progress] `/`[member] `/`[transfer] `/`[netdisk] ` 前缀），`cmd/dmesh/main.go` 新增 `--json`（隐含 `--no-ui`）。`progress.go` 补 v27 行，`langs/{zh,en}.json` 的 `help.text` 无头条目改写。契约测试实测把两处真漂移揪了出来：`ActAppealUnban` 无头侧漏接（裁定：登记 `guiOnly`，同一出站动作无头经 `/unban <pub>` 直达），`/deny latest` 原样把字符串 `latest` 交给宿主（改为与 `/approve` 同样先定位收件箱再归一化成具体 id）。门禁=gofmt/vet 静默、`go test -count=1 ./...` 13 包全绿（新增：动作全表双向契约、16 条命令→宿主调用对齐表、缺参/未知 id/宿主报错三种 `ok=false`、队列按 id 定位、只读回报、`--json` 形状）。无头 `--json` 实测（单节点新建群）：`/members`/`/progress`/`/netdisk status`/发言/`/theme` 均 `ok:true` 带 `kind`+`texts`，`/join approve latest` 空队列报 `join queue: queue empty`、`/kick` 报 `usage: /kick <pubkey>`，全部落在一行一对象的机器可读轨上。
+  - **附带修复（v23 遗留观察，本版实测复现并闭环）**：v23 落实记录留的「headless --run-for 到点未自退待后续核查」——根因是 `main.run()` 的无头 `select` 只等 `ctx.Done()` 与 `serve` 错误，而 `shutdown()` 的信号住在 `n.done`（GUI 事件泵走 `NextEvent` 拿 nil），于是 `/quit` 与 `--run-for` 都关不掉进程、心跳还在往已关闭的 store 里报错。加 `case <-n.done` 一行后实测：`/quit` 3.1s 干净退出 exit=0、`--run-for 4s` 到点自退 exit=0；stdin EOF 仍**不**等于退出（`< /dev/null` 式常驻节点行为不变，与 v26 之前一致）。
+  - 验收进度面板：`/progress` 38 行含 v27 changelog；`/netdisk status` 在无 ≥3 配额主机时按既有语义报 `not enough quota hosts`（属 PLAN-NETDISK N4 范畴，本版未动）。
+
+
 ## 附：口头问答定论（未成版本，但为消歧义记录）
 - 「发送消息的时间戳是怎么来的？」→ 定论：`ts_ms` 为**发送者本机时钟自报 + 本人签名锁死**；接收端另存本地收到时刻仅参考；时钟偏差/虚报无法证伪（已知风险），故**一切安全判定不依赖时间戳真值**（在场=展示属性，名单收敛=靠签名链+多源比对而非 ts）。
 - 「重说生命周期」（两次）→ 均为纯文字复述，无设计变更。
