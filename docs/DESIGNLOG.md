@@ -102,6 +102,11 @@
 - 定稿：仿 v21 语言文件模式——① 内置主题 `internal/ui/themes/{light,dark}.json`（go:embed 内嵌保单构建、值与 v23 Go 字面量逐一等价渲染零漂移，theme.go 删除全部调色板字面量）；② 外置 `<data-dir>/themes/*.json` 运行期叠加（`LoadThemeDir` 与 `LoadLangDir` 同接线点同套路）：**新文件=新主题、同名文件=按 token 覆盖**；③ 文件格式：token 键=palette 字段小驼峰（windowBG/chatBG/bubbleSelf/caret/tabActive…），色值 `#RGB`/`#RRGGBB`/`#RRGGBBAA`，`avatar`=色值数组（不足 8 位补底），未知键忽略保前向兼容；新建主题以 light 为底合并，允许只写差异；④ `SetTheme`/`ThemeList`/`LoadThemePref` 改读动态主题表，`/theme` 命令与 ui_prefs.json 语义不变（headless 不读主题偏好、但加载 themes 目录，自定义主题两通道均可用）；⑤ UI-only：协议层/viewModel 语义/App 门面零改动；`progress.go` changelog 补 v24 行。验收：门禁全绿+外置主题加载/覆盖/非法文件测试+真窗口切入外置新主题实测+light/dark 与 v23 渲染逐像素等价。
 
 
+## v25 — 命令全面 GUI 化：输入框只打字，动作改按钮/菜单/对话框
+- **原话**：「当前项目是命令太多了将命令全部改为gui操作后续所有 添加的操作都是用gui」（2026-09-27）
+- **追问裁定**：① 命令去留 = 「GUI 彻底废除，无头保留」——窗口内不再解析任何斜杠命令，`/` 开头的输入按普通聊天文本原样发送；`ParseCommand` 退为无头 stdin（`cmd/dmesh/node.go`）专用，脚本与 E2E 通道语义零变化。② 落地节奏 = 「全量一次到位」——24 类命令 + 全部面板字母键动作一批换成 GUI 控件，不分批。
+- 定稿（PLAN 条目 18）：全量映射表（命令→顶栏按钮/行右键菜单/勾选与下拉对话框/原生文件选择框）；输入框从此只承载聊天正文；删除数字键 1..6 抢键切面板（打字首字符「1」被吞属缺陷），面板切换用鼠标点标签、Tab 作导航快捷键保留；基建 = `internal/ui/actions.go`（`Action{ID,Label,Enabled,Confirm}` + `PanelActions()`/`RunAction()`，不适用项置灰不隐藏）、`ViewLine.Row` 加性字段（鼠标命中→选中行精确映射，右击先选中再弹菜单）、统一浮层栈（dialog 四型 text/number/choice/checks + menu，Esc 关最上层）、Windows `comdlg32!GetOpenFileNameW` 原生文件选择框（stdlib syscall，无 cgo、零新依赖，LockOSThread goroutine 经 deliver 异步回投；非 Windows 或失败回退手输路径文本框）。**协议层、`ui.App` 门面、事件结构零改动**——所有动作复用既有 Kick/Unban/SetPerms/ApproveJoin/… 方法。langs 补 `gui.*` 键并改写 help/面板提示；`commands_test.go` 保留（无头），`viewmodel_test.go` 经 submit 下发命令的用例改走 RunAction/对话框。验收：门禁全绿 + 真窗口逐项点完映射表 + 双实例 E2E（GUI 点击签 join→消息落盘送达）+ 无头命令回归零变化。
+
 ## 附：口头问答定论（未成版本，但为消歧义记录）
 - 「发送消息的时间戳是怎么来的？」→ 定论：`ts_ms` 为**发送者本机时钟自报 + 本人签名锁死**；接收端另存本地收到时刻仅参考；时钟偏差/虚报无法证伪（已知风险），故**一切安全判定不依赖时间戳真值**（在场=展示属性，名单收敛=靠签名链+多源比对而非 ts）。
 - 「重说生命周期」（两次）→ 均为纯文字复述，无设计变更。
