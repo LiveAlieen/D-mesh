@@ -37,6 +37,7 @@ var changelog = []versionNote{
 	{"v21", "语言目录 JSON 文件化：go:embed 内嵌 + 外置 langs 目录可扩展"},
 	{"v22", "默认语言固定中文 + 补做 v18 /progress 欠账"},
 	{"v23", "GUI 重写 QQ 风格浅色渲染 + /theme 深浅双主题"},
+	{"v24", "主题文件化：调色板迁 JSON（go:embed 内嵌 + 外置 themes 目录可扩展）"},
 }
 
 type milestone struct {

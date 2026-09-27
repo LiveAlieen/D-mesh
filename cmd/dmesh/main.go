@@ -127,6 +127,13 @@ func run(o *opts) error {
 		logger.Printf("langs: %v", err)
 	}
 
+	// 0.6 外置主题目录（v24）：<data>/themes/*.json 叠加进内置 go:embed 主题，
+	//     新文件=新主题、同名文件=按 token 覆盖——加主题只放文件不改代码。
+	//     GUI 与 headless 都加载（headless 只是不读 ui_prefs.json 的主题偏好）。
+	if err := ui.LoadThemeDir(filepath.Join(o.data, "themes")); err != nil {
+		logger.Printf("themes: %v", err)
+	}
+
 	// 1. 身份密钥（identity 包 import/init 即把 ed25519 验签注册进 core.Register，
 	//    即 core 的算法注册表入口；group.RegisterEd25519Verifier 幂等再兜一次）。
 	idPath := o.identity
